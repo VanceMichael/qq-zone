@@ -90,6 +90,9 @@ type Spider struct {
 	debugLines []string        // 回退/失败明细，等当前相册进度条结束后再打印，避免和 mpb 抢终端
 	albumStats videoDebugStats // 当前相册内各视频链路的命中次数
 	taskStats  videoDebugStats // 整次备份任务的链路命中次数，用于最后一行「全部视频」汇总
+
+	// planListPhotos 仅测试使用：替换预检时的相册分页清单拉取链路；nil 时走真实客户端。
+	planListPhotos func(ctx context.Context, targetUin, groupID, albumID string) ([]gjson.Result, error)
 }
 
 // videoDebugStats 统计调试模式下各视频实际走了哪条拉取链路。
@@ -168,28 +171,56 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
 		}
 	}
 
-	// 丢掉无权访问的，以及用户没勾选的相册。
-	filteredAlbums := make([]gjson.Result, 0)
-	for _, album := range albums {
-		name := album.Get("name").String()
-		allow := album.Get("allowAccess").Int()
+	filteredAlbums := s.selectAccessibleAlbums(albums)
 
-		if allow == 0 {
-			s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", name)
-			continue
-		}
-		if len(s.whitelist) > 0 && !s.whitelist[name] {
-			continue
-		}
-		filteredAlbums = append(filteredAlbums, album)
+	return s.runAlbums(ctx, p, targetUin, filteredAlbums, exclude)
+}
+
+// SelectAlbums 丢掉无权访问和不在勾选名单里的相册；whitelist 为空表示全部可选。
+// 预检和即时下载用同一条过滤规则，保证计划覆盖的相册集合与执行时一致。
+func SelectAlbums(albums []gjson.Result, whitelist []string) []gjson.Result {
+	wl := make(map[string]bool, len(whitelist))
+	for _, name := range whitelist {
+		wl[name] = true
 	}
+	out := make([]gjson.Result, 0, len(albums))
+	for _, album := range albums {
+		if album.Get("allowAccess").Int() == 0 {
+			continue
+		}
+		if len(wl) > 0 && !wl[album.Get("name").String()] {
+			continue
+		}
+		out = append(out, album)
+	}
+	return out
+}
 
+// selectAccessibleAlbums 是 Spider 实例版，附加 whitelist 与调试日志。
+func (s *Spider) selectAccessibleAlbums(albums []gjson.Result) []gjson.Result {
+	names := make([]string, 0, len(s.whitelist))
+	for name := range s.whitelist {
+		names = append(names, name)
+	}
+	filtered := SelectAlbums(albums, names)
+	if len(filtered) < len(albums) {
+		for _, album := range albums {
+			if album.Get("allowAccess").Int() == 0 {
+				s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", album.Get("name").String())
+			}
+		}
+	}
+	return filtered
+}
+
+// runAlbums 串行执行给定相册集合；Download（现拉清单）和 DownloadPlan（冻结清单）共用同一收尾逻辑。
+func (s *Spider) runAlbums(ctx context.Context, p *mpb.Progress, targetUin string, albums []gjson.Result, exclude bool) (*DownloadResult, error) {
 	// 调试模式：任务开始打印图例，相册结束打回退明细和汇总，全部结束后再打总汇总。
 	s.resetVideoDebugLogs()
 	s.logVideoDebugHint()
 
 	// 相册必须一个下完再下下一个，避免同时打太多相册列表接口触发风控。
-	for i, album := range filteredAlbums {
+	for i, album := range albums {
 		select {
 		case <-ctx.Done():
 			s.logger.Warn("任务已被用户取消")
@@ -200,8 +231,44 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
 		default:
 		}
 
-		if err := s.downloadAlbum(ctx, p, targetUin, album, i+1, len(filteredAlbums), exclude); err != nil {
+		if err := s.downloadAlbum(ctx, p, targetUin, album, i+1, len(albums), exclude); err != nil {
 			s.logger.Errorf("failed to download album [%s]: %v", album.Get("name").String(), err)
+		}
+	}
+
+	p.Wait()
+	s.flushVideoDebugLogs()
+	s.flushTaskVideoSummary()
+	return &s.results, nil
+}
+
+// DownloadPlan 执行备份预检确认时冻结下来的清单。
+// 关键保证：这里不再重新拉取相册/照片列表，只消费 plan 里的同一份媒体；
+// 因此确认后到执行之间空间侧新增的照片不会被静默加入。
+// 视频下载地址若已过期，仍由现有解析链按同一 sloc 重新解析——只换取源 URL，不换媒体身份。
+func (s *Spider) DownloadPlan(ctx context.Context, targetUin string, plan *BackupPlan) (*DownloadResult, error) {
+	if plan == nil {
+		return nil, fmt.Errorf("备份计划为空，无法开始下载")
+	}
+	s.results = DownloadResult{}
+
+	p := mpb.NewWithContext(ctx)
+	s.resetVideoDebugLogs()
+	s.logVideoDebugHint()
+
+	for i, frozen := range plan.Albums {
+		select {
+		case <-ctx.Done():
+			s.logger.Warn("任务已被用户取消")
+			p.Wait()
+			s.flushVideoDebugLogs()
+			s.flushTaskVideoSummary()
+			return &s.results, nil
+		default:
+		}
+
+		if err := s.processAlbumPhotos(ctx, p, targetUin, frozen.Album, frozen.Photos, i+1, len(plan.Albums), plan.Exclude); err != nil {
+			s.logger.Errorf("failed to download album [%s]: %v", frozen.Album.Get("name").String(), err)
 		}
 	}
 
@@ -288,12 +355,29 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems 
 	return &s.results, nil
 }
 
-// downloadAlbum 负责下载单个相册内的所有照片和视频。
+// downloadAlbum 现拉单个相册的完整照片清单，再交给 processAlbumPhotos 下载。
+func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin string, album gjson.Result, albumIdx, albumTotal int, exclude bool) error {
+	var (
+		photos []gjson.Result
+		err    error
+	)
+	if s.isGroupMode() {
+		photos, err = s.client.GetGroupPhotoList(ctx, s.groupID, album.Get("id").String())
+	} else {
+		photos, err = s.client.GetPhotoList(ctx, targetUin, album.Get("id").String())
+	}
+	if err != nil {
+		return err
+	}
+	return s.processAlbumPhotos(ctx, p, targetUin, album, photos, albumIdx, albumTotal, exclude)
+}
+
+// processAlbumPhotos 下载单个相册内给定的照片/视频集合。
+// Download 与 DownloadPlan（预检冻结清单）都走这里，保证执行逻辑完全一致。
 // 并发由 active（正在下的文件数）和 currentLimit（同时允许几路）卡住；
 // 开启智能动态并发时，另有观察协程每 2 秒按吞吐和失败数加减上限。
-func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin string, album gjson.Result, albumIdx, albumTotal int, exclude bool) error {
+func (s *Spider) processAlbumPhotos(ctx context.Context, p *mpb.Progress, targetUin string, album gjson.Result, photos []gjson.Result, albumIdx, albumTotal int, exclude bool) error {
 	albumName := album.Get("name").String()
-	albumID := album.Get("id").String()
 	albumPath := s.buildAlbumPath(targetUin, albumName)
 	s.resetAlbumVideoStats()
 
@@ -301,19 +385,6 @@ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin s
 	if s.config.EnableMetadataExport {
 		metaPath := filepath.Join(albumPath, "album_metadata.json")
 		_ = os.WriteFile(metaPath, []byte(album.Raw), 0644)
-	}
-
-	var (
-		photos []gjson.Result
-		err    error
-	)
-	if s.isGroupMode() {
-		photos, err = s.client.GetGroupPhotoList(ctx, s.groupID, albumID)
-	} else {
-		photos, err = s.client.GetPhotoList(ctx, targetUin, albumID)
-	}
-	if err != nil {
-		return err
 	}
 
 	atomic.AddUint64(&s.results.Total, uint64(len(photos)))
@@ -467,14 +538,21 @@ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin s
 	return waitErr
 }
 
-// downloadItem 负责处理单个文件 (照片/实况图/普通视频) 的分析、路径拼接、断点续传检查与下载调用。
-func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin string, photo, album gjson.Result, albumPath string, exclude bool, localFiles map[string]string) error {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
+// mediaSpec 是单个媒体在本地落盘的身份与命名信息。
+// 预检规划（容量估算）和真正下载必须共用同一份规则，否则计划里的路径会和执行时对不上。
+type mediaSpec struct {
+	sloc         string    // 空间侧媒体稳定身份，文件名哈希、视频浮层解析都用它
+	originalName string    // 原始展示名，仅用于日志和失败项
+	shootTime    time.Time // 拍摄时间（退回上传时间），零值表示未知
+	shootDate    string    // yyyyMMddHHmmss，未知时为空串
+	isVideo      bool
+	imageURL     string // 图片下载地址：raw → origin_url → url，并把 b&bo 换成 o&bo
+	imageName    string // 图片预测文件名（可能在下载时按 Content-Type 改后缀）
+	videoName    string // 视频文件名，固定 .mp4
+}
 
+// buildMediaSpec 按与 downloadItem 完全相同的规则推导单个媒体的时间线、文件名和图片地址。
+func (s *Spider) buildMediaSpec(photo gjson.Result) mediaSpec {
 	sloc := photo.Get("sloc").String()
 	originalName := photo.Get("name").String()
 	if originalName == "" {
@@ -482,13 +560,13 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 	}
 
 	// 拍摄时间优先，没有再用上传时间；后面用来起文件名、按年/月归档、回写本地修改时间。
-	shootTime := photo.Get("rawshoottime").String()
-	if shootTime == "" || shootTime == "0" {
-		shootTime = photo.Get("uploadtime").String()
+	shootTimeField := photo.Get("rawshoottime").String()
+	if shootTimeField == "" || shootTimeField == "0" {
+		shootTimeField = photo.Get("uploadtime").String()
 	}
 
 	loc, _ := time.LoadLocation("Local")
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", shootTime, loc)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", shootTimeField, loc)
 	if err != nil {
 		uploadTime := photo.Get("uploadtime").String()
 		t, _ = time.ParseInLocation("2006-01-02 15:04:05", uploadTime, loc)
@@ -504,7 +582,6 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 		filenameDate = "00000000000000"
 	}
 
-	var tasks []mediaTask
 	isVideo := photo.Get("is_video").Bool()
 
 	// 图片地址：raw → origin_url → url；b&bo= 改成 o&bo= 尽量拿原图而不是预览。
@@ -531,35 +608,79 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 	}
 	imgFilename += ext
 
-	if isVideo {
-		// 下载时再解析视频多源，避免相册列表里的 URL 排队后过期。
-		var (
-			source   *qzone.VideoSource
-			videoErr error
-		)
-		if s.isGroupMode() {
-			source = qzone.GroupVideoSource(photo)
-			if source == nil || len(source.Candidates) == 0 {
-				videoErr = fmt.Errorf("群相册视频地址为空")
-			}
-		} else {
-			source, videoErr = s.client.GetVideoSource(ctx, targetUin, album.Get("id").String(), sloc, photo)
+	vidFilename := fmt.Sprintf("VID_%s_%s_%s.mp4", filenameDate[:8], filenameDate[8:], util.MD5(sloc)[8:24])
+
+	return mediaSpec{
+		sloc:         sloc,
+		originalName: originalName,
+		shootTime:    t,
+		shootDate:    shootDate,
+		isVideo:      isVideo,
+		imageURL:     imgSource,
+		imageName:    imgFilename,
+		videoName:    vidFilename,
+	}
+}
+
+// resolveMediaCandidates 返回该媒体实际下载时会按顺序尝试的候选地址。
+// 图片只有一条直链；群视频从清单 JSON 直接取；个人视频走浮层解析链。
+// 下载地址在预检后过期没关系：执行时仍按同一 sloc（媒体身份）重新解析，只会换 URL 不会换媒体。
+func (s *Spider) resolveMediaCandidates(ctx context.Context, targetUin string, album gjson.Result, spec mediaSpec, photo gjson.Result) ([]qzone.VideoCandidate, string, error) {
+	if !spec.isVideo {
+		return []qzone.VideoCandidate{{URL: spec.imageURL, Kind: "image"}}, "", nil
+	}
+
+	if s.isGroupMode() {
+		source := qzone.GroupVideoSource(photo)
+		if source == nil || len(source.Candidates) == 0 {
+			return nil, "", fmt.Errorf("群相册视频地址为空")
 		}
-		if videoErr != nil || source == nil || len(source.Candidates) == 0 {
-			s.results.addFailedItem(s.makeFailedItem(targetUin, album, photo, sloc, videoErr, true))
+		return source.Candidates, source.VideoID, nil
+	}
+
+	// 下载时再解析视频多源，避免相册列表里的 URL 排队后过期。
+	source, err := s.client.GetVideoSource(ctx, targetUin, album.Get("id").String(), spec.sloc, photo)
+	if err != nil {
+		return nil, "", err
+	}
+	if source == nil || len(source.Candidates) == 0 {
+		return nil, "", fmt.Errorf("视频地址为空")
+	}
+	return source.Candidates, source.VideoID, nil
+}
+
+// downloadItem 负责处理单个文件 (照片/实况图/普通视频) 的分析、路径拼接、断点续传检查与下载调用。
+func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin string, photo, album gjson.Result, albumPath string, exclude bool, localFiles map[string]string) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	spec := s.buildMediaSpec(photo)
+	sloc := spec.sloc
+	originalName := spec.originalName
+	t := spec.shootTime
+	shootDate := spec.shootDate
+	isVideo := spec.isVideo
+
+	var tasks []mediaTask
+	candidates, videoID, sourceErr := s.resolveMediaCandidates(ctx, targetUin, album, spec, photo)
+	if isVideo {
+		if sourceErr != nil || len(candidates) == 0 {
+			s.results.addFailedItem(s.makeFailedItem(targetUin, album, photo, sloc, sourceErr, true))
 			return nil
 		}
-		vidFilename := fmt.Sprintf("VID_%s_%s_%s.mp4", filenameDate[:8], filenameDate[8:], util.MD5(sloc)[8:24])
 		tasks = append(tasks, mediaTask{
-			candidates: source.Candidates,
-			videoID:    source.VideoID,
-			filename:   vidFilename,
+			candidates: candidates,
+			videoID:    videoID,
+			filename:   spec.videoName,
 			isVideo:    true,
 		})
 	} else {
 		tasks = append(tasks, mediaTask{
-			candidates: []qzone.VideoCandidate{{URL: imgSource, Kind: "image"}},
-			filename:   imgFilename,
+			candidates: candidates,
+			filename:   spec.imageName,
 			isVideo:    false,
 		})
 	}

@@ -165,8 +165,6 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
 		c.logger.Warnf("⚠️  群 [%s] 没有相册，或当前账号无权查看", group.DisplayName())
 		return c.askStayInGroupPicker("换一个群试试?")
 	}
-	_ = qzone.RememberGroup(c.client.QQ, group)
-
 	exclude, ok := c.askAlbumTaskOptions()
 	if !ok {
 		return groupFlowPicker
@@ -177,6 +175,29 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
 		return groupFlowPicker
 	}
 
+	// 写盘前预检：拉完整清单、逐项估算、查目标卷容量，确认前零写入。
+	plannedAlbums := app.SelectAlbums(allAlbums, finalAlbums)
+	plan, planErr := app.NewGroupSpider(c.client, c.config, finalAlbums, group.ID, group.DisplayName(), c.logger).
+		BuildBackupPlan(ctx, c.client.QQ, plannedAlbums, exclude)
+	if planErr != nil {
+		c.logger.Errorf("❌ 备份预检未能完成: %v", planErr)
+		return c.askStayInGroupPicker("换一个群试试?")
+	}
+	if plan.Total == 0 {
+		c.logger.Warn("⚠️ 所选相册没有可备份的媒体，已结束，未创建任务记录或文件。")
+		return c.askStayInGroupPicker("换一个群试试?")
+	}
+	switch c.reviewBackupPlan(plan) {
+	case planRejected:
+		return c.askStayInGroupPicker("目标卷空间不足。清理磁盘或换个目标盘后再来。现在换一个群试试?")
+	case planCancelled:
+		c.logger.Info("🚫 已取消备份：未创建任务记录、目录、临时文件或媒体内容。")
+		return groupFlowPicker
+	}
+
+	// 用户确认后才允许产生副作用：记住群号、任务日志和任务记录都放在预检通过之后。
+	_ = qzone.RememberGroup(c.client.QQ, group)
+
 	taskLogger := c.createTaskLogger(c.client.QQ)
 	record := app.NewTaskRecord(app.TaskModeGroupAlbum, c.client.QQ, c.client.QQ, finalAlbums, c.config, exclude)
 	record.GroupID = group.ID
@@ -186,7 +207,7 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
 	spider := app.NewGroupSpider(c.client, c.config, finalAlbums, group.ID, group.DisplayName(), taskLogger)
 
 	fmt.Println(color.HiBlackString("\n━━━━━━━━━━━━━━━━━━━━━━ 正在下载群相册 ━━━━━━━━━━━━━━━━━━━━━━"))
-	results, runErr := spider.Download(ctx, c.client.QQ, exclude)
+	results, runErr := spider.DownloadPlan(ctx, c.client.QQ, plan)
 	fmt.Println(color.HiBlackString("━━━━━━━━━━━━━━━━━━━━━━ 下载完成 ━━━━━━━━━━━━━━━━━━━━━━"))
 
 	status := c.determineTaskStatus(ctx, results, runErr)

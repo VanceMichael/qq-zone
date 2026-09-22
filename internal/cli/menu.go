@@ -436,6 +436,27 @@ func (c *CLI) handleSpider(ctx context.Context, targetUin string) {
 		return
 	}
 
+	// 写盘前预检：拉完整清单、逐项估算、查目标卷容量，确认前零写入。
+	plannedAlbums := app.SelectAlbums(allAlbums, finalAlbums)
+	plan, planErr := app.NewSpider(c.client, c.config, finalAlbums, c.logger).
+		BuildBackupPlan(ctx, targetUin, plannedAlbums, exclude)
+	if planErr != nil {
+		c.logger.Errorf("❌ 备份预检未能完成: %v", planErr)
+		return
+	}
+	if plan.Total == 0 {
+		c.logger.Warn("⚠️ 所选相册没有可备份的媒体，已结束，未创建任务记录或文件。")
+		return
+	}
+	switch c.reviewBackupPlan(plan) {
+	case planRejected:
+		return
+	case planCancelled:
+		c.logger.Info("🚫 已取消备份：未创建任务记录、目录、临时文件或媒体内容。")
+		return
+	}
+
+	// 用户确认后才允许产生副作用：任务日志、任务记录均在此之后创建。
 	taskLogger := c.createTaskLogger(targetUin)
 	record := app.NewTaskRecord(app.TaskModeBackup, c.client.QQ, targetUin, finalAlbums, c.config, exclude)
 	c.saveTaskRecord(record, nil, nil, app.TaskStatusPending)
@@ -443,7 +464,7 @@ func (c *CLI) handleSpider(ctx context.Context, targetUin string) {
 	spider := app.NewSpider(c.client, c.config, finalAlbums, taskLogger)
 
 	fmt.Println(color.HiBlackString("\n━━━━━━━━━━━━━━━━━━━━━━ 正在下载 ━━━━━━━━━━━━━━━━━━━━━━"))
-	results, runErr := spider.Download(ctx, targetUin, exclude)
+	results, runErr := spider.DownloadPlan(ctx, targetUin, plan)
 	fmt.Println(color.HiBlackString("━━━━━━━━━━━━━━━━━━━━━━ 下载完成 ━━━━━━━━━━━━━━━━━━━━━━"))
 
 	status := c.determineTaskStatus(ctx, results, runErr)

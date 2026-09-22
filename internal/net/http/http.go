@@ -209,6 +209,144 @@ func (c *Client) Head(ctx context.Context, url string, headers map[string]string
 	return resp.Header(), nil
 }
 
+// ProbeSize 在不下载实体的前提下探测媒体的完整字节数，仅供备份预检估算容量使用。
+// 先走 HEAD；HEAD 不被 CDN 支持时再发一次 bytes=0-0 的极简 GET，从 Content-Range 取总长度。
+// 探测本身不写盘，也不走全局限流（与大文件下载同级），任何一步拿不到可靠长度都返回错误，
+// 由调用方把该项计入「大小未知」，不能当作 0 字节。
+func (c *Client) ProbeSize(ctx context.Context, uri string, headers map[string]string) (int64, error) {
+	if strings.TrimSpace(uri) == "" {
+		return 0, fmt.Errorf("probe size: empty url")
+	}
+	probeHeaders := cloneStringMap(headers)
+	// 下载头里可能带 Range: bytes=0-，HEAD/探测请求不能复用，否则长度语义被污染。
+	delete(probeHeaders, "Range")
+
+	size, headErr := c.ProbeSizeHead(ctx, uri, probeHeaders)
+	if headErr == nil && size > 0 {
+		return size, nil
+	}
+
+	rangeSize, rangeErr := c.ProbeSizeRange(ctx, uri, probeHeaders)
+	if rangeErr == nil && rangeSize > 0 {
+		return rangeSize, nil
+	}
+	if headErr == nil {
+		headErr = fmt.Errorf("head: no reliable content length")
+	}
+	return 0, fmt.Errorf("probe size failed; head: %v; range get: %w", headErr, rangeErr)
+}
+
+// ProbeSizeHead 只发一次 HEAD 并取完整长度。它与下载流程中 shouldSkipExisting 的跳过判定依据一致，
+// 预检必须用同一个依据判断「完整跳过」，避免计划与执行结论不一致。
+func (c *Client) ProbeSizeHead(ctx context.Context, uri string, headers map[string]string) (int64, error) {
+	resp, err := c.resty.R().
+		SetContext(ctx).
+		SetHeaders(headers).
+		Head(uri)
+	if err != nil {
+		return 0, err
+	}
+	if resp.IsError() {
+		return 0, &StatusError{Code: resp.StatusCode(), Status: resp.Status()}
+	}
+	if size := reliableContentLength(resp.StatusCode(), resp.Header()); size > 0 {
+		return size, nil
+	}
+	return 0, fmt.Errorf("head: no reliable content length")
+}
+
+// ProbeSizeRange 只发一次 bytes=0-0 的极简 GET，从 206 的 Content-Range 取完整长度。
+// 这与真正下载走的 Range 请求同源，CDN 拒绝 HEAD 时仍能拿到可靠长度。
+func (c *Client) ProbeSizeRange(ctx context.Context, uri string, headers map[string]string) (int64, error) {
+	getHeaders := cloneStringMap(headers)
+	delete(getHeaders, "Range")
+	getHeaders["Range"] = "bytes=0-0"
+	resp, err := c.resty.R().
+		SetContext(ctx).
+		SetHeaders(getHeaders).
+		SetDoNotParseResponse(true).
+		Get(uri)
+	if err != nil {
+		return 0, err
+	}
+	if body := resp.RawBody(); body != nil {
+		_ = body.Close()
+	}
+	if resp.IsError() {
+		return 0, &StatusError{Code: resp.StatusCode(), Status: resp.Status()}
+	}
+	if size := reliableContentLength(resp.StatusCode(), resp.Header()); size > 0 {
+		return size, nil
+	}
+	return 0, fmt.Errorf("range get: no reliable content length")
+}
+
+// reliableContentLength 从响应头里提取媒体的完整长度。
+// 206 必须以 Content-Range 的总长为准（此时 Content-Length 只是本次分片长度，例如 1）；
+// 其余状态取 Content-Length。拿不到可靠正值时返回 0。
+func reliableContentLength(statusCode int, header http.Header) int64 {
+	if statusCode == http.StatusPartialContent {
+		if total, err := parseContentRangeTotal(header.Get("Content-Range")); err == nil && total > 0 {
+			return total
+		}
+	}
+	if raw := strings.TrimSpace(header.Get("Content-Length")); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// parseContentRangeTotal 解析 "bytes 0-0/12345" 形式的总长度；实例长度未知（"bytes 0-0/*"）视为失败。
+func parseContentRangeTotal(contentRange string) (int64, error) {
+	if contentRange == "" {
+		return 0, fmt.Errorf("missing Content-Range header")
+	}
+	parts := strings.SplitN(contentRange, " ", 2)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("malformed Content-Range: %s", contentRange)
+	}
+	rangePart := strings.SplitN(parts[1], "/", 2)
+	if len(rangePart) != 2 {
+		return 0, fmt.Errorf("malformed Content-Range: %s", contentRange)
+	}
+	total := strings.TrimSpace(rangePart[1])
+	if total == "" || total == "*" {
+		return 0, fmt.Errorf("unknown instance length in Content-Range: %s", contentRange)
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid Content-Range total %q: %w", total, err)
+	}
+	return n, nil
+}
+
+// ResumeSidecar 只读返回目标文件当前的续传状态：本地已有字节数、sidecar 记录的源 URL。
+// 预检用它判断半成品能否按同一 URL 续 Range。整个函数不创建、不修改任何文件：
+// 文件不存在返回 (0, "", false)；有半成品但 sidecar 缺失/损坏时 hasURI=false（下载时会作废重下）。
+func ResumeSidecar(target string) (localSize int64, uri string, hasURI bool) {
+	fi, err := os.Stat(target)
+	if err != nil || fi.Size() <= 0 {
+		return 0, "", false
+	}
+	localSize = fi.Size()
+	if meta, loadErr := loadResumeMetadata(resumeMetadataPath(target)); loadErr == nil && meta != nil {
+		if u := strings.TrimSpace(meta.URI); u != "" {
+			return localSize, u, true
+		}
+	}
+	return localSize, "", false
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 // PostForm 发起一个 HTTP POST 表单请求，用于提交数据。
 func (c *Client) PostForm(ctx context.Context, url string, params map[string]string, headers map[string]string) ([]byte, error) {
 	if err := c.limiter.Wait(ctx); err != nil {

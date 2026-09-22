@@ -1,0 +1,1712 @@
+diff --git a/internal/app/backup_plan.go b/internal/app/backup_plan.go
+new file mode 100644
+index 0000000..729e052
+--- /dev/null
++++ b/internal/app/backup_plan.go
+@@ -0,0 +1,438 @@
++// 备份预检（写盘前容量规划）：拉取完整分页清单，按与真正下载相同的路径、时间线和本地索引规则，
++// 把每项媒体分为「新下载 / 完整跳过 / 可续传 / 大小未知」，并在用户确认前给出字节级容量账。
++//
++// 硬约束：整个预检只读，不创建任务记录、目录、临时文件，也不写媒体内容；
++// 确认后的下载必须消费这里冻结的同一份清单（见 Spider.DownloadPlan）。
++
++package app
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"strings"
++	"time"
++
++	ihttp "github.com/qinjintian/qq-zone/internal/net/http"
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++	"github.com/qinjintian/qq-zone/internal/qzone"
++	"github.com/tidwall/gjson"
++	"github.com/vbauerster/mpb/v8"
++	"github.com/vbauerster/mpb/v8/decor"
++	"golang.org/x/sync/errgroup"
++)
++
++// planProbeTimeout 单个媒体大小探测（HEAD + 首字节 GET）的超时。
++const planProbeTimeout = 20 * time.Second
++
++// PlanItemKind 是预检给单个媒体定的处置类别。
++type PlanItemKind string
++
++const (
++	// PlanItemNew 本地没有完整文件，需要整份新下载，按远端完整长度计字节。
++	PlanItemNew PlanItemKind = "new"
++	// PlanItemSkip 增量模式下本地已有不小于远端长度的同名文件，会被完整跳过，计 0 字节。
++	PlanItemSkip PlanItemKind = "skip"
++	// PlanItemResume 本地有与同一 URL 绑定的半成品，可以 Range 续传，只计尚未写入的字节。
++	PlanItemResume PlanItemKind = "resume"
++	// PlanItemUnknown HEAD/首字节探测失败、仅 HLS/getinfo 源或没有可靠 Content-Length。
++	// 明确单列、不计入已知字节，绝不能当成 0 字节。
++	PlanItemUnknown PlanItemKind = "unknown"
++)
++
++// PlanItem 是单个媒体在预检时的容量账。
++type PlanItem struct {
++	AlbumName  string       // 所属相册名（展示用）
++	Name       string       // 预测的本地文件名
++	IsVideo    bool         // 是否视频
++	Kind       PlanItemKind // 处置类别
++	RemoteSize int64        // 探测到的远端完整字节数；未知为 0
++	LocalSize  int64        // 本地已存在的字节数（跳过/续传判定依据）
++	Remaining  int64        // 本次预计还要写入的字节数；跳过和未知为 0
++	Reason     string       // 未知原因等说明
++}
++
++// FrozenAlbum 是确认时刻冻结的一个相册：相册元数据 + 完整分页媒体清单。
++// DownloadPlan 只消费它，不再二次拉取，因此执行时不会静默混入确认后新增的照片。
++type FrozenAlbum struct {
++	Album  gjson.Result
++	Photos []gjson.Result
++}
++
++// BackupPlan 是一份只读预检的结果，也是确认后下载执行的唯一清单来源。
++type BackupPlan struct {
++	TargetUin string // 被备份空间的 QQ（群相册时即当前登录 QQ）
++	GroupID   string // 非空表示群相册
++	GroupName string
++	Exclude   bool // 当时选择的增量模式
++
++	Albums []FrozenAlbum // 冻结的相册与媒体清单
++	Items  []PlanItem    // 与 Albums 展开顺序一致的逐项容量账
++
++	Total        int // 媒体总数
++	NewCount     int // 新下载项数
++	SkipCount    int // 完整跳过项数
++	ResumeCount  int // 可续传项数
++	UnknownCount int // 大小未知项数
++
++	NewBytes        int64 // 新下载项的完整字节合计
++	ResumeBytes     int64 // 续传项「尚未写入」字节合计
++	ResumeHaveBytes int64 // 续传项本地已存在的字节（仅展示）
++	KnownRemaining  int64 // 已知至少要写入的字节 = NewBytes + ResumeBytes
++
++	VolumePath  string // 实际用于容量查询的现存目录
++	FreeBytes   int64  // 目标卷普通用户可用字节
++	VolumeTotal int64  // 目标卷总字节
++	BuiltAt     time.Time
++}
++
++// SpaceShortage 判断已知待写字节是否已超过目标卷可用空间；为真时必须在产生任何副作用前拒绝。
++func (p *BackupPlan) SpaceShortage() bool {
++	return p != nil && p.KnownRemaining > p.FreeBytes
++}
++
++// planSlot 是并发探测队列里的一个工作槽：媒体身份 + 它所属相册的只读本地索引。
++type planSlot struct {
++	album      gjson.Result
++	photo      gjson.Result
++	albumPath  string
++	localFiles map[string]string
++}
++
++// planCandidateProbe 单条候选地址的探测结果：
++// headSize/hasHead 与 shouldSkipExisting 同源（只带 cookie 的 HEAD），专供「完整跳过」判定；
++// size 是容量账使用的可靠完整长度（HEAD 优先，HEAD 不行再走与下载同源的 Range GET）。
++// index 是该候选在候选列表中的优先级序号，续传只可能发生在最高优先级候选上。
++type planCandidateProbe struct {
++	index    int
++	url      string
++	headSize int64
++	hasHead  bool
++	size     int64
++}
++
++// BuildBackupPlan 在写盘前完成预检：查容量 → 拉完整分页清单 → 逐项分类与计字节。
++// 整个过程不创建目录、临时文件或任务记录。分页中途失败返回错误，整份计划作废；
++// 单个媒体探测失败只产生一个 unknown 项，不影响其他项。
++func (s *Spider) BuildBackupPlan(ctx context.Context, targetUin string, selected []gjson.Result, exclude bool) (*BackupPlan, error) {
++	plan := &BackupPlan{
++		TargetUin: strings.TrimSpace(targetUin),
++		GroupID:   s.groupID,
++		GroupName: s.groupName,
++		Exclude:   exclude,
++		BuiltAt:   time.Now(),
++	}
++
++	// 容量先查：查不到就显式报错并中止，保证零写入。
++	root := s.storageRoot(targetUin)
++	mount, free, total, err := util.VolumeFreeSpace(root)
++	if err != nil {
++		return nil, fmt.Errorf("无法获取目标卷可用空间，预检中止（尚未写入任何文件）: %w", err)
++	}
++	plan.VolumePath, plan.FreeBytes, plan.VolumeTotal = mount, free, total
++
++	// 第一步：把入选相册的媒体清单全部拉完。任一页失败都让整份计划无效，不能拿半截清单做容量账。
++	p := mpb.NewWithContext(ctx)
++	wait := waitSpinner(p, "预检: 正在拉取完整媒体清单")
++	for _, album := range selected {
++		select {
++		case <-ctx.Done():
++			stopWaitSpinner(wait)
++			p.Wait()
++			return nil, ctx.Err()
++		default:
++		}
++
++		photos, fetchErr := s.fetchPlanPhotos(ctx, targetUin, album.Get("id").String())
++		if fetchErr != nil {
++			stopWaitSpinner(wait)
++			p.Wait()
++			return nil, fmt.Errorf("相册 [%s] 的分页清单拉取失败，整份预检计划无效，网络恢复后请重新规划: %w",
++				album.Get("name").String(), fetchErr)
++		}
++		plan.Albums = append(plan.Albums, FrozenAlbum{Album: album, Photos: photos})
++	}
++	stopWaitSpinner(wait)
++
++	// 第二步：展开工作槽。本地索引只读构建，绝不 MkdirAll / RemoveAll。
++	slots := make([]planSlot, 0)
++	for _, frozen := range plan.Albums {
++		albumPath := s.plannedMediaDir(targetUin, frozen.Album.Get("name").String())
++		var localFiles map[string]string
++		if exclude {
++			localFiles = readOnlyMediaIndex(albumPath)
++		}
++		for _, photo := range frozen.Photos {
++			slots = append(slots, planSlot{
++				album:      frozen.Album,
++				photo:      photo,
++				albumPath:  albumPath,
++				localFiles: localFiles,
++			})
++		}
++	}
++	plan.Total = len(slots)
++	plan.Items = make([]PlanItem, len(slots))
++
++	if len(slots) > 0 {
++		probeBar := p.AddBar(int64(len(slots)),
++			mpb.BarRemoveOnComplete(),
++			mpb.PrependDecorators(
++				decor.Name("预检: 探测媒体大小 ", decor.WC{W: 24, C: decor.DindentRight}),
++				decor.CountersNoUnit("%d / %d"),
++			),
++			mpb.AppendDecorators(
++				decor.Percentage(),
++				decor.Name(" ] "),
++				decor.OnComplete(decor.Name("", decor.WC{W: 5}), "Done!"),
++			),
++		)
++
++		workers := int32(s.config.TaskLimit)
++		if workers < 1 {
++			workers = 10
++		}
++
++		g, gCtx := errgroup.WithContext(ctx)
++		jobCh := make(chan int)
++		g.Go(func() error {
++			defer close(jobCh)
++			for i := range slots {
++				select {
++				case <-gCtx.Done():
++					return gCtx.Err()
++				case jobCh <- i:
++				}
++			}
++			return nil
++		})
++		for w := int32(0); w < workers; w++ {
++			g.Go(func() error {
++				for idx := range jobCh {
++					slot := slots[idx]
++					plan.Items[idx] = s.planOneItem(gCtx, targetUin, slot.album, slot.photo, slot.localFiles, exclude)
++					probeBar.Increment()
++				}
++				return nil
++			})
++		}
++		waitErr := g.Wait()
++		probeBar.SetCurrent(int64(len(slots)))
++		probeBar.SetTotal(int64(len(slots)), true)
++		p.Wait()
++		if waitErr != nil {
++			return nil, waitErr
++		}
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++	} else {
++		p.Wait()
++	}
++
++	plan.aggregate()
++	return plan, nil
++}
++
++// fetchPlanPhotos 拉单个相册的完整分页清单；测试可用 planListPhotos 替换整条网络链路。
++func (s *Spider) fetchPlanPhotos(ctx context.Context, targetUin, albumID string) ([]gjson.Result, error) {
++	if s.planListPhotos != nil {
++		return s.planListPhotos(ctx, targetUin, s.groupID, albumID)
++	}
++	if s.isGroupMode() {
++		return s.client.GetGroupPhotoList(ctx, s.groupID, albumID)
++	}
++	return s.client.GetPhotoList(ctx, targetUin, albumID)
++}
++
++// planOneItem 按与 downloadItem / shouldSkipExisting 相同的规则给单个媒体分类计字节。
++func (s *Spider) planOneItem(ctx context.Context, targetUin string, album, photo gjson.Result, localFiles map[string]string, exclude bool) PlanItem {
++	spec := s.buildMediaSpec(photo)
++	filename := spec.imageName
++	if spec.isVideo {
++		filename = spec.videoName
++	}
++	item := PlanItem{
++		AlbumName: album.Get("name").String(),
++		Name:      filename,
++		IsVideo:   spec.isVideo,
++		Kind:      PlanItemUnknown,
++	}
++
++	candidates, _, resolveErr := s.resolveMediaCandidates(ctx, targetUin, album, spec, photo)
++	if resolveErr != nil || len(candidates) == 0 {
++		if resolveErr == nil {
++			resolveErr = fmt.Errorf("无可用下载地址")
++		}
++		item.Reason = "媒体源解析失败: " + resolveErr.Error()
++		return item
++	}
++
++	// 增量模式下查本地同名（去扩展名）文件；非增量模式目录会在执行时整体重下，不看本地。
++	var (
++		localSize  int64
++		sidecarURI string
++		hasSidecar bool
++	)
++	if exclude {
++		base := strings.TrimSuffix(filename, filepath.Ext(filename))
++		if existingPath, ok := localFiles[base]; ok {
++			localSize, sidecarURI, hasSidecar = ihttp.ResumeSidecar(existingPath)
++		}
++	}
++
++	// 按候选优先级探测：getinfo / HLS 与 shouldSkipExisting 一样视为不可靠长度来源直接跳过。
++	hits := make([]planCandidateProbe, 0, len(candidates))
++	sawUnreliable := false
++	for i, cand := range candidates {
++		if cand.Kind == qzone.VideoSourceGetInfo || ihttp.IsHLSURL(cand.URL) {
++			sawUnreliable = true
++			continue
++		}
++		if hit, ok := s.probeCandidatePlan(ctx, targetUin, i, cand, spec.isVideo); ok {
++			hits = append(hits, hit)
++		}
++	}
++
++	if len(hits) == 0 {
++		if sawUnreliable {
++			item.Reason = "仅 HLS/getinfo 等无可靠长度的来源，大小未知（不计入已知字节）"
++		} else {
++			item.Reason = "HEAD/首字节探测失败或无可靠 Content-Length，大小未知（不计入已知字节）"
++		}
++		return item
++	}
++
++	first := hits[0]
++	item.RemoteSize = first.size
++
++	if exclude && localSize > 0 {
++		// 与 shouldSkipExisting 完全一致：任一候选的「仅 cookie HEAD」声明长度不超过本地 → 完整跳过。
++		for _, hit := range hits {
++			if hit.hasHead && hit.headSize <= localSize {
++				item.Kind = PlanItemSkip
++				item.LocalSize = localSize
++				item.Remaining = 0
++				return item
++			}
++		}
++		if first.size > localSize {
++			// 只有最高优先级候选、且 sidecar 与该 URL 匹配的半成品能续 Range；
++			// 否则下载层会先按换源规则删掉半成品重下（见 http.Download），按整份新下载计字节更安全。
++			if first.index == 0 && hasSidecar && sidecarURI == first.url {
++				item.Kind = PlanItemResume
++				item.LocalSize = localSize
++				item.Remaining = first.size - localSize
++				return item
++			}
++			item.Kind = PlanItemNew
++			item.Remaining = first.size
++			return item
++		}
++	}
++
++	item.Kind = PlanItemNew
++	item.Remaining = first.size
++	return item
++}
++
++// probeCandidatePlan 探测一条候选地址。
++// hasHead/headSize 来自与 shouldSkipExisting 相同的「仅 cookie HEAD」；
++// size 是容量账长度（HEAD 优先，失败再用真实下载头做 HEAD+Range GET）。
++// 视频带 Cookie 被 403/404 时与 downloadCandidate 一样去掉 Cookie 再试一次。
++func (s *Spider) probeCandidatePlan(ctx context.Context, targetUin string, index int, cand qzone.VideoCandidate, isVideo bool) (planCandidateProbe, bool) {
++	hit := planCandidateProbe{index: index, url: cand.URL}
++
++	headCtx, headCancel := context.WithTimeout(ctx, planProbeTimeout)
++	headSize, headErr := s.client.Http.ProbeSizeHead(headCtx, cand.URL, map[string]string{"cookie": s.client.Cookie})
++	headCancel()
++	if headErr == nil && headSize > 0 {
++		hit.hasHead = true
++		hit.headSize = headSize
++		hit.size = headSize
++		return hit, true
++	}
++
++	call := func(h map[string]string) (int64, error) {
++		pctx, cancel := context.WithTimeout(ctx, planProbeTimeout)
++		defer cancel()
++		return s.client.Http.ProbeSize(pctx, cand.URL, h)
++	}
++	downloadHeaders := s.buildDownloadHeaders(targetUin, cand.URL, isVideo, cand.Kind)
++	size, err := call(downloadHeaders)
++	if err == nil && size > 0 {
++		hit.size = size
++		return hit, true
++	}
++	if isVideo && err != nil && downloadHeaders["cookie"] != "" && ihttp.IsDeadURL(err) {
++		anon := cloneHeaders(downloadHeaders)
++		delete(anon, "cookie")
++		if size2, err2 := call(anon); err2 == nil && size2 > 0 {
++			hit.size = size2
++			return hit, true
++		}
++	}
++	return hit, false
++}
++
++// aggregate 汇总各类计数与字节账。
++func (p *BackupPlan) aggregate() {
++	p.Total = len(p.Items)
++	for _, item := range p.Items {
++		switch item.Kind {
++		case PlanItemNew:
++			p.NewCount++
++			p.NewBytes += item.Remaining
++		case PlanItemResume:
++			p.ResumeCount++
++			p.ResumeBytes += item.Remaining
++			p.ResumeHaveBytes += item.LocalSize
++		case PlanItemSkip:
++			p.SkipCount++
++		default:
++			p.UnknownCount++
++		}
++	}
++	p.KnownRemaining = p.NewBytes + p.ResumeBytes
++}
++
++// storageRoot 是该目标所有媒体写入位置的公共根目录，容量查询就挂在它所在的卷上。
++func (s *Spider) storageRoot(targetUin string) string {
++	if s.isGroupMode() {
++		return filepath.Join("storage", "qzone", targetUin, "qun", sanitizePath(s.groupID))
++	}
++	return filepath.Join("storage", "qzone", targetUin, "album")
++}
++
++// plannedMediaDir 只推导相册目录而不创建它（与 buildMediaDir 的路径规则一致，但零写入）。
++// 目录已存在时按真实目录取（含历史哈希兜底目录）；尚不存在时返回首选路径，留给确认后的下载去建。
++func (s *Spider) plannedMediaDir(targetUin, albumName string) string {
++	baseDir := filepath.Join("storage", "qzone", targetUin, "album")
++	if s.isGroupMode() {
++		baseDir = filepath.Join("storage", "qzone", targetUin, "qun", sanitizePath(s.groupID))
++	}
++	preferred := filepath.Join(baseDir, sanitizePath(albumName))
++	if util.IsDir(preferred) {
++		return preferred
++	}
++	hashed := filepath.Join(baseDir, util.MD5(albumName)[8:24])
++	if util.IsDir(hashed) {
++		return hashed
++	}
++	return preferred
++}
++
++// readOnlyMediaIndex 与 buildLocalFileIndex 的增量索引规则相同（去扩展名建键、递归时间线子目录），
++// 但只读：不建目录、不清目录。
++func readOnlyMediaIndex(albumPath string) map[string]string {
++	localFiles := make(map[string]string)
++	files, _ := util.ListFiles(albumPath)
++	for _, f := range files {
++		name := filepath.Base(f)
++		if idx := strings.LastIndex(name, "."); idx != -1 {
++			name = name[:idx]
++		}
++		localFiles[name] = f
++	}
++	return localFiles
++}
+diff --git a/internal/app/backup_plan_test.go b/internal/app/backup_plan_test.go
+new file mode 100644
+index 0000000..91c16f3
+--- /dev/null
++++ b/internal/app/backup_plan_test.go
+@@ -0,0 +1,330 @@
++// 备份预检（BackupPlan）分类、冻结清单与零写入保证的单元测试
++
++package app
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	ihttp "github.com/qinjintian/qq-zone/internal/net/http"
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++	"github.com/qinjintian/qq-zone/internal/qzone"
++	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
++)
++
++const (
++	planTestUin       = "100001"
++	planTestAlbumID   = "a1"
++	planTestAlbumName = "Album A"
++	planTestUpload    = "2021-03-04 05:06:07"
++	planTestSize      = 1000
++)
++
++// newPlanTestServer 提供：HEAD 声明 1000 字节的 /img.jpg、404 的 /dead、可完整 GET 的图片实体。
++func newPlanTestServer(t *testing.T) *httptest.Server {
++	t.Helper()
++	mux := http.NewServeMux()
++	mux.HandleFunc("/img.jpg", func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "image/jpeg")
++		w.Header().Set("Content-Length", fmt.Sprintf("%d", planTestSize))
++		if r.Method == http.MethodGet {
++			_, _ = w.Write(make([]byte, planTestSize))
++		}
++	})
++	mux.HandleFunc("/dead", func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNotFound)
++	})
++	// HEAD 一律拒绝（cookie 头与下载头都试），只有 Range GET 返回总长。
++	// 用来锁定：没有 HEAD 依据时即使本地等长也不能判「完整跳过」（下载层会作废重下）。
++	mux.HandleFunc("/head-denied", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodHead {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		w.Header().Set("Content-Range", "bytes 0-0/1000")
++		w.Header().Set("Content-Length", "1")
++		w.WriteHeader(http.StatusPartialContent)
++		_, _ = w.Write([]byte("x"))
++	})
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++func newPlanTestSpider(t *testing.T, groupID string) *Spider {
++	t.Helper()
++	client := &qzone.Client{QQ: planTestUin, Http: ihttp.NewClient()}
++	cfg := &Config{TaskLimit: 4, EnableTimeline: false, EnableMetadataExport: false}
++	if groupID != "" {
++		return NewGroupSpider(client, cfg, nil, groupID, "测试群", zap.NewNop().Sugar())
++	}
++	return NewSpider(client, cfg, nil, zap.NewNop().Sugar())
++}
++
++func planPhoto(sloc, raw string) gjson.Result {
++	return gjson.Parse(fmt.Sprintf(`{"sloc":%q,"raw":%q,"uploadtime":%q}`, sloc, raw, planTestUpload))
++}
++
++func planAlbum() gjson.Result {
++	return gjson.Parse(fmt.Sprintf(`{"id":%q,"name":%q,"allowAccess":1}`, planTestAlbumID, planTestAlbumName))
++}
++
++// classifyOne 走单项预检分类（exclude 控制增量），由各用例按需准备本地目录。
++func classifyOne(t *testing.T, s *Spider, photo gjson.Result, exclude bool) PlanItem {
++	t.Helper()
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	var index map[string]string
++	if exclude {
++		index = readOnlyMediaIndex(albumPath)
++	}
++	return s.planOneItem(context.Background(), planTestUin, planAlbum(), photo, index, exclude)
++}
++
++func TestPlanItemNewDownload(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++
++	item := classifyOne(t, s, planPhoto("s1", srv.URL+"/img.jpg"), true)
++	if item.Kind != PlanItemNew || item.RemoteSize != planTestSize || item.Remaining != planTestSize {
++		t.Fatalf("新下载分类错误: %+v", item)
++	}
++}
++
++func TestPlanItemCompleteSkip(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++	photo := planPhoto("s2", srv.URL+"/img.jpg")
++	predicted := s.buildMediaSpec(photo).imageName
++
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	if err := os.MkdirAll(albumPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// 本地文件已与远端等长，增量模式应判完整跳过、计 0 字节。
++	if err := os.WriteFile(filepath.Join(albumPath, predicted), make([]byte, planTestSize), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	item := classifyOne(t, s, photo, true)
++	if item.Kind != PlanItemSkip || item.Remaining != 0 || item.LocalSize != planTestSize {
++		t.Fatalf("完整跳过分类错误: %+v", item)
++	}
++}
++
++func TestPlanItemResume(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++	photo := planPhoto("s3", srv.URL+"/img.jpg")
++	predicted := s.buildMediaSpec(photo).imageName
++
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	if err := os.MkdirAll(albumPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	target := filepath.Join(albumPath, predicted)
++	if err := os.WriteFile(target, make([]byte, 400), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	// sidecar 与最高优先级候选同一 URL：可续传，只计尚未写入的 600 字节。
++	meta := fmt.Sprintf(`{"uri":%q}`, srv.URL+"/img.jpg")
++	if err := os.WriteFile(target+".resume.json", []byte(meta), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	item := classifyOne(t, s, photo, true)
++	if item.Kind != PlanItemResume || item.Remaining != 600 || item.LocalSize != 400 || item.RemoteSize != 1000 {
++		t.Fatalf("可续传分类错误: %+v", item)
++	}
++}
++
++func TestPlanItemPartialWithoutSidecarIsNew(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++	photo := planPhoto("s4", srv.URL+"/img.jpg")
++	predicted := s.buildMediaSpec(photo).imageName
++
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	if err := os.MkdirAll(albumPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// 有半成品但 sidecar 缺失：下载层会先删后重下，预检必须按整份新下载计 1000 字节。
++	if err := os.WriteFile(filepath.Join(albumPath, predicted), make([]byte, 400), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	item := classifyOne(t, s, photo, true)
++	if item.Kind != PlanItemNew || item.Remaining != planTestSize {
++		t.Fatalf("无 sidecar 半成品应按新下载计整份字节: %+v", item)
++	}
++}
++
++func TestPlanItemHeadFailurePreventsSkip(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++	photo := planPhoto("s2b", srv.URL+"/head-denied")
++	predicted := s.buildMediaSpec(photo).imageName
++
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	if err := os.MkdirAll(albumPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(albumPath, predicted), make([]byte, planTestSize), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// 与 shouldSkipExisting 一致：HEAD 拿不到长度就不能判跳过；真实执行会作废半成品整份重下，
++	// 预检必须按新下载 1000 字节计，而不是跳过计 0。
++	item := classifyOne(t, s, photo, true)
++	if item.Kind != PlanItemNew || item.Remaining != planTestSize {
++		t.Fatalf("HEAD 不可用时不能跳过，应按新下载计整份: %+v", item)
++	}
++}
++
++func TestPlanItemProbeFailureIsUnknown(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++
++	item := classifyOne(t, s, planPhoto("s5", srv.URL+"/dead"), true)
++	if item.Kind != PlanItemUnknown || item.Remaining != 0 || item.Reason == "" {
++		t.Fatalf("探测失败必须列为未知且不计字节: %+v", item)
++	}
++}
++
++func TestPlanItemNonIncrementalIgnoresLocal(t *testing.T) {
++	t.Chdir(t.TempDir())
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++	photo := planPhoto("s6", srv.URL+"/img.jpg")
++	predicted := s.buildMediaSpec(photo).imageName
++
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	if err := os.MkdirAll(albumPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// 本地已有完整文件，但非增量模式执行时会清空重下，预检必须按新下载计整份。
++	if err := os.WriteFile(filepath.Join(albumPath, predicted), make([]byte, planTestSize), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	item := classifyOne(t, s, photo, false)
++	if item.Kind != PlanItemNew || item.Remaining != planTestSize {
++		t.Fatalf("非增量模式必须按整份新下载计: %+v", item)
++	}
++}
++
++func TestPlanItemHLSAlwaysUnknown(t *testing.T) {
++	t.Chdir(t.TempDir())
++	s := newPlanTestSpider(t, "123456")
++	photo := gjson.Parse(`{"sloc":"gv1","is_video":true,"videodata":{"actionurl":"https://vod.example.com/a.m3u8"}}`)
++
++	item := classifyOne(t, s, photo, true)
++	if item.Kind != PlanItemUnknown || item.Remaining != 0 {
++		t.Fatalf("仅 HLS 源必须列为未知且不能当 0 字节跳过: %+v", item)
++	}
++}
++
++func TestBuildBackupPlanFreezesAndWritesNothing(t *testing.T) {
++	tmp := t.TempDir()
++	t.Chdir(tmp)
++	srv := newPlanTestServer(t)
++	s := newPlanTestSpider(t, "")
++
++	listCalls := 0
++	s.planListPhotos = func(ctx context.Context, targetUin, groupID, albumID string) ([]gjson.Result, error) {
++		listCalls++
++		return []gjson.Result{
++			planPhoto("f1", srv.URL+"/img.jpg"),
++			planPhoto("f2", srv.URL+"/img.jpg"),
++		}, nil
++	}
++
++	albumRoot := filepath.Join("storage", "qzone", planTestUin, "album")
++	if _, err := os.Stat(albumRoot); !os.IsNotExist(err) {
++		t.Fatalf("预检前相册根目录不应存在")
++	}
++
++	plan, err := s.BuildBackupPlan(context.Background(), planTestUin, []gjson.Result{planAlbum()}, true)
++	if err != nil {
++		t.Fatalf("构建预检计划失败: %v", err)
++	}
++	if plan.Total != 2 || plan.NewCount != 2 || plan.KnownRemaining != 2*planTestSize {
++		t.Fatalf("计划计数错误: total=%d new=%d bytes=%d", plan.Total, plan.NewCount, plan.KnownRemaining)
++	}
++	if plan.FreeBytes <= 0 || plan.VolumePath == "" {
++		t.Fatalf("目标卷容量必须被填充: free=%d mount=%q", plan.FreeBytes, plan.VolumePath)
++	}
++	if len(plan.Albums) != 1 || len(plan.Albums[0].Photos) != 2 {
++		t.Fatal("冻结清单必须包含两个相册项的完整媒体列表")
++	}
++	if listCalls != 1 {
++		t.Fatalf("预检期间每个相册应只拉一次清单, got %d", listCalls)
++	}
++	// 预检零写入：相册根目录仍不能被创建。
++	if _, err := os.Stat(albumRoot); !os.IsNotExist(err) {
++		t.Fatal("预检结束后不应创建任何相册目录/文件")
++	}
++
++	// 执行阶段只能消费冻结清单：不得再次触发分页拉取。
++	results, runErr := s.DownloadPlan(context.Background(), planTestUin, plan)
++	if runErr != nil {
++		t.Fatalf("执行冻结计划失败: %v", runErr)
++	}
++	if listCalls != 1 {
++		t.Fatalf("执行阶段重新拉取了清单（%d 次），冻结保证被破坏", listCalls)
++	}
++	if results.Total != 2 || results.Success != 2 || results.NewAdded != 2 {
++		t.Fatalf("冻结计划执行结果错误: %+v", results)
++	}
++
++	// 两个文件都真实落盘（时间线关闭，直接在相册目录下）。
++	albumPath := s.plannedMediaDir(planTestUin, planTestAlbumName)
++	got, err := util.ListFiles(albumPath)
++	if err != nil || len(got) != 2 {
++		t.Fatalf("应有 2 个文件落盘, got %d, err=%v", len(got), err)
++	}
++	for _, f := range got {
++		if fi, statErr := os.Stat(f); statErr != nil || fi.Size() != planTestSize {
++			t.Fatalf("落盘文件大小错误: %s %v", f, statErr)
++		}
++	}
++}
++
++func TestBuildBackupPlanPaginationFailureInvalidatesPlan(t *testing.T) {
++	t.Chdir(t.TempDir())
++	s := newPlanTestSpider(t, "")
++	s.planListPhotos = func(ctx context.Context, targetUin, groupID, albumID string) ([]gjson.Result, error) {
++		return nil, fmt.Errorf("connection reset by peer")
++	}
++
++	plan, err := s.BuildBackupPlan(context.Background(), planTestUin, []gjson.Result{planAlbum()}, true)
++	if err == nil || plan != nil {
++		t.Fatalf("分页中途失败必须返回错误并作废整份计划: plan=%v err=%v", plan, err)
++	}
++	// 零写入保证。
++	if _, statErr := os.Stat(filepath.Join("storage", "qzone", planTestUin)); !os.IsNotExist(statErr) {
++		t.Fatalf("分页失败后不应留下任何目录: %v", statErr)
++	}
++}
++
++func TestBackupPlanSpaceShortage(t *testing.T) {
++	plan := &BackupPlan{KnownRemaining: 100, FreeBytes: 99}
++	if !plan.SpaceShortage() {
++		t.Fatal("已知待写大于可用空间时必须判定不足")
++	}
++	plan.FreeBytes = 100
++	if plan.SpaceShortage() {
++		t.Fatal("容量刚好够时不应判定不足")
++	}
++}
+diff --git a/internal/app/spider.go b/internal/app/spider.go
+index d2f8d81..e818770 100644
+--- a/internal/app/spider.go
++++ b/internal/app/spider.go
+@@ -90,6 +90,9 @@ type Spider struct {
+ 	debugLines []string        // 回退/失败明细，等当前相册进度条结束后再打印，避免和 mpb 抢终端
+ 	albumStats videoDebugStats // 当前相册内各视频链路的命中次数
+ 	taskStats  videoDebugStats // 整次备份任务的链路命中次数，用于最后一行「全部视频」汇总
++
++	// planListPhotos 仅测试使用：替换预检时的相册分页清单拉取链路；nil 时走真实客户端。
++	planListPhotos func(ctx context.Context, targetUin, groupID, albumID string) ([]gjson.Result, error)
+ }
+ 
+ // videoDebugStats 统计调试模式下各视频实际走了哪条拉取链路。
+@@ -168,28 +171,56 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
+ 		}
+ 	}
+ 
+-	// 丢掉无权访问的，以及用户没勾选的相册。
+-	filteredAlbums := make([]gjson.Result, 0)
+-	for _, album := range albums {
+-		name := album.Get("name").String()
+-		allow := album.Get("allowAccess").Int()
++	filteredAlbums := s.selectAccessibleAlbums(albums)
++
++	return s.runAlbums(ctx, p, targetUin, filteredAlbums, exclude)
++}
+ 
+-		if allow == 0 {
+-			s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", name)
++// SelectAlbums 丢掉无权访问和不在勾选名单里的相册；whitelist 为空表示全部可选。
++// 预检和即时下载用同一条过滤规则，保证计划覆盖的相册集合与执行时一致。
++func SelectAlbums(albums []gjson.Result, whitelist []string) []gjson.Result {
++	wl := make(map[string]bool, len(whitelist))
++	for _, name := range whitelist {
++		wl[name] = true
++	}
++	out := make([]gjson.Result, 0, len(albums))
++	for _, album := range albums {
++		if album.Get("allowAccess").Int() == 0 {
+ 			continue
+ 		}
+-		if len(s.whitelist) > 0 && !s.whitelist[name] {
++		if len(wl) > 0 && !wl[album.Get("name").String()] {
+ 			continue
+ 		}
+-		filteredAlbums = append(filteredAlbums, album)
++		out = append(out, album)
+ 	}
++	return out
++}
+ 
++// selectAccessibleAlbums 是 Spider 实例版，附加 whitelist 与调试日志。
++func (s *Spider) selectAccessibleAlbums(albums []gjson.Result) []gjson.Result {
++	names := make([]string, 0, len(s.whitelist))
++	for name := range s.whitelist {
++		names = append(names, name)
++	}
++	filtered := SelectAlbums(albums, names)
++	if len(filtered) < len(albums) {
++		for _, album := range albums {
++			if album.Get("allowAccess").Int() == 0 {
++				s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", album.Get("name").String())
++			}
++		}
++	}
++	return filtered
++}
++
++// runAlbums 串行执行给定相册集合；Download（现拉清单）和 DownloadPlan（冻结清单）共用同一收尾逻辑。
++func (s *Spider) runAlbums(ctx context.Context, p *mpb.Progress, targetUin string, albums []gjson.Result, exclude bool) (*DownloadResult, error) {
+ 	// 调试模式：任务开始打印图例，相册结束打回退明细和汇总，全部结束后再打总汇总。
+ 	s.resetVideoDebugLogs()
+ 	s.logVideoDebugHint()
+ 
+ 	// 相册必须一个下完再下下一个，避免同时打太多相册列表接口触发风控。
+-	for i, album := range filteredAlbums {
++	for i, album := range albums {
+ 		select {
+ 		case <-ctx.Done():
+ 			s.logger.Warn("任务已被用户取消")
+@@ -200,7 +231,7 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
+ 		default:
+ 		}
+ 
+-		if err := s.downloadAlbum(ctx, p, targetUin, album, i+1, len(filteredAlbums), exclude); err != nil {
++		if err := s.downloadAlbum(ctx, p, targetUin, album, i+1, len(albums), exclude); err != nil {
+ 			s.logger.Errorf("failed to download album [%s]: %v", album.Get("name").String(), err)
+ 		}
+ 	}
+@@ -211,6 +242,42 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
+ 	return &s.results, nil
+ }
+ 
++// DownloadPlan 执行备份预检确认时冻结下来的清单。
++// 关键保证：这里不再重新拉取相册/照片列表，只消费 plan 里的同一份媒体；
++// 因此确认后到执行之间空间侧新增的照片不会被静默加入。
++// 视频下载地址若已过期，仍由现有解析链按同一 sloc 重新解析——只换取源 URL，不换媒体身份。
++func (s *Spider) DownloadPlan(ctx context.Context, targetUin string, plan *BackupPlan) (*DownloadResult, error) {
++	if plan == nil {
++		return nil, fmt.Errorf("备份计划为空，无法开始下载")
++	}
++	s.results = DownloadResult{}
++
++	p := mpb.NewWithContext(ctx)
++	s.resetVideoDebugLogs()
++	s.logVideoDebugHint()
++
++	for i, frozen := range plan.Albums {
++		select {
++		case <-ctx.Done():
++			s.logger.Warn("任务已被用户取消")
++			p.Wait()
++			s.flushVideoDebugLogs()
++			s.flushTaskVideoSummary()
++			return &s.results, nil
++		default:
++		}
++
++		if err := s.processAlbumPhotos(ctx, p, targetUin, frozen.Album, frozen.Photos, i+1, len(plan.Albums), plan.Exclude); err != nil {
++			s.logger.Errorf("failed to download album [%s]: %v", frozen.Album.Get("name").String(), err)
++		}
++	}
++
++	p.Wait()
++	s.flushVideoDebugLogs()
++	s.flushTaskVideoSummary()
++	return &s.results, nil
++}
++
+ // RetryFailed 基于历史任务记录中保存的失败上下文，仅重试仍未解决的失败文件。
+ // 失败重试始终强制使用增量模式，避免误删已经成功下载的数据。
+ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems []FailedItem) (*DownloadResult, error) {
+@@ -288,33 +355,37 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems
+ 	return &s.results, nil
+ }
+ 
+-// downloadAlbum 负责下载单个相册内的所有照片和视频。
+-// 并发由 active（正在下的文件数）和 currentLimit（同时允许几路）卡住；
+-// 开启智能动态并发时，另有观察协程每 2 秒按吞吐和失败数加减上限。
++// downloadAlbum 现拉单个相册的完整照片清单，再交给 processAlbumPhotos 下载。
+ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin string, album gjson.Result, albumIdx, albumTotal int, exclude bool) error {
+-	albumName := album.Get("name").String()
+-	albumID := album.Get("id").String()
+-	albumPath := s.buildAlbumPath(targetUin, albumName)
+-	s.resetAlbumVideoStats()
+-
+-	// 把相册原始 JSON 落到目录里，方便以后对照空间侧字段。
+-	if s.config.EnableMetadataExport {
+-		metaPath := filepath.Join(albumPath, "album_metadata.json")
+-		_ = os.WriteFile(metaPath, []byte(album.Raw), 0644)
+-	}
+-
+ 	var (
+ 		photos []gjson.Result
+ 		err    error
+ 	)
+ 	if s.isGroupMode() {
+-		photos, err = s.client.GetGroupPhotoList(ctx, s.groupID, albumID)
++		photos, err = s.client.GetGroupPhotoList(ctx, s.groupID, album.Get("id").String())
+ 	} else {
+-		photos, err = s.client.GetPhotoList(ctx, targetUin, albumID)
++		photos, err = s.client.GetPhotoList(ctx, targetUin, album.Get("id").String())
+ 	}
+ 	if err != nil {
+ 		return err
+ 	}
++	return s.processAlbumPhotos(ctx, p, targetUin, album, photos, albumIdx, albumTotal, exclude)
++}
++
++// processAlbumPhotos 下载单个相册内给定的照片/视频集合。
++// Download 与 DownloadPlan（预检冻结清单）都走这里，保证执行逻辑完全一致。
++// 并发由 active（正在下的文件数）和 currentLimit（同时允许几路）卡住；
++// 开启智能动态并发时，另有观察协程每 2 秒按吞吐和失败数加减上限。
++func (s *Spider) processAlbumPhotos(ctx context.Context, p *mpb.Progress, targetUin string, album gjson.Result, photos []gjson.Result, albumIdx, albumTotal int, exclude bool) error {
++	albumName := album.Get("name").String()
++	albumPath := s.buildAlbumPath(targetUin, albumName)
++	s.resetAlbumVideoStats()
++
++	// 把相册原始 JSON 落到目录里，方便以后对照空间侧字段。
++	if s.config.EnableMetadataExport {
++		metaPath := filepath.Join(albumPath, "album_metadata.json")
++		_ = os.WriteFile(metaPath, []byte(album.Raw), 0644)
++	}
+ 
+ 	atomic.AddUint64(&s.results.Total, uint64(len(photos)))
+ 
+@@ -467,14 +538,21 @@ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin s
+ 	return waitErr
+ }
+ 
+-// downloadItem 负责处理单个文件 (照片/实况图/普通视频) 的分析、路径拼接、断点续传检查与下载调用。
+-func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin string, photo, album gjson.Result, albumPath string, exclude bool, localFiles map[string]string) error {
+-	select {
+-	case <-ctx.Done():
+-		return nil
+-	default:
+-	}
++// mediaSpec 是单个媒体在本地落盘的身份与命名信息。
++// 预检规划（容量估算）和真正下载必须共用同一份规则，否则计划里的路径会和执行时对不上。
++type mediaSpec struct {
++	sloc         string    // 空间侧媒体稳定身份，文件名哈希、视频浮层解析都用它
++	originalName string    // 原始展示名，仅用于日志和失败项
++	shootTime    time.Time // 拍摄时间（退回上传时间），零值表示未知
++	shootDate    string    // yyyyMMddHHmmss，未知时为空串
++	isVideo      bool
++	imageURL     string // 图片下载地址：raw → origin_url → url，并把 b&bo 换成 o&bo
++	imageName    string // 图片预测文件名（可能在下载时按 Content-Type 改后缀）
++	videoName    string // 视频文件名，固定 .mp4
++}
+ 
++// buildMediaSpec 按与 downloadItem 完全相同的规则推导单个媒体的时间线、文件名和图片地址。
++func (s *Spider) buildMediaSpec(photo gjson.Result) mediaSpec {
+ 	sloc := photo.Get("sloc").String()
+ 	originalName := photo.Get("name").String()
+ 	if originalName == "" {
+@@ -482,13 +560,13 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 	}
+ 
+ 	// 拍摄时间优先，没有再用上传时间；后面用来起文件名、按年/月归档、回写本地修改时间。
+-	shootTime := photo.Get("rawshoottime").String()
+-	if shootTime == "" || shootTime == "0" {
+-		shootTime = photo.Get("uploadtime").String()
++	shootTimeField := photo.Get("rawshoottime").String()
++	if shootTimeField == "" || shootTimeField == "0" {
++		shootTimeField = photo.Get("uploadtime").String()
+ 	}
+ 
+ 	loc, _ := time.LoadLocation("Local")
+-	t, err := time.ParseInLocation("2006-01-02 15:04:05", shootTime, loc)
++	t, err := time.ParseInLocation("2006-01-02 15:04:05", shootTimeField, loc)
+ 	if err != nil {
+ 		uploadTime := photo.Get("uploadtime").String()
+ 		t, _ = time.ParseInLocation("2006-01-02 15:04:05", uploadTime, loc)
+@@ -504,7 +582,6 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 		filenameDate = "00000000000000"
+ 	}
+ 
+-	var tasks []mediaTask
+ 	isVideo := photo.Get("is_video").Bool()
+ 
+ 	// 图片地址：raw → origin_url → url；b&bo= 改成 o&bo= 尽量拿原图而不是预览。
+@@ -531,35 +608,79 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 	}
+ 	imgFilename += ext
+ 
+-	if isVideo {
+-		// 下载时再解析视频多源，避免相册列表里的 URL 排队后过期。
+-		var (
+-			source   *qzone.VideoSource
+-			videoErr error
+-		)
+-		if s.isGroupMode() {
+-			source = qzone.GroupVideoSource(photo)
+-			if source == nil || len(source.Candidates) == 0 {
+-				videoErr = fmt.Errorf("群相册视频地址为空")
+-			}
+-		} else {
+-			source, videoErr = s.client.GetVideoSource(ctx, targetUin, album.Get("id").String(), sloc, photo)
++	vidFilename := fmt.Sprintf("VID_%s_%s_%s.mp4", filenameDate[:8], filenameDate[8:], util.MD5(sloc)[8:24])
++
++	return mediaSpec{
++		sloc:         sloc,
++		originalName: originalName,
++		shootTime:    t,
++		shootDate:    shootDate,
++		isVideo:      isVideo,
++		imageURL:     imgSource,
++		imageName:    imgFilename,
++		videoName:    vidFilename,
++	}
++}
++
++// resolveMediaCandidates 返回该媒体实际下载时会按顺序尝试的候选地址。
++// 图片只有一条直链；群视频从清单 JSON 直接取；个人视频走浮层解析链。
++// 下载地址在预检后过期没关系：执行时仍按同一 sloc（媒体身份）重新解析，只会换 URL 不会换媒体。
++func (s *Spider) resolveMediaCandidates(ctx context.Context, targetUin string, album gjson.Result, spec mediaSpec, photo gjson.Result) ([]qzone.VideoCandidate, string, error) {
++	if !spec.isVideo {
++		return []qzone.VideoCandidate{{URL: spec.imageURL, Kind: "image"}}, "", nil
++	}
++
++	if s.isGroupMode() {
++		source := qzone.GroupVideoSource(photo)
++		if source == nil || len(source.Candidates) == 0 {
++			return nil, "", fmt.Errorf("群相册视频地址为空")
+ 		}
+-		if videoErr != nil || source == nil || len(source.Candidates) == 0 {
+-			s.results.addFailedItem(s.makeFailedItem(targetUin, album, photo, sloc, videoErr, true))
++		return source.Candidates, source.VideoID, nil
++	}
++
++	// 下载时再解析视频多源，避免相册列表里的 URL 排队后过期。
++	source, err := s.client.GetVideoSource(ctx, targetUin, album.Get("id").String(), spec.sloc, photo)
++	if err != nil {
++		return nil, "", err
++	}
++	if source == nil || len(source.Candidates) == 0 {
++		return nil, "", fmt.Errorf("视频地址为空")
++	}
++	return source.Candidates, source.VideoID, nil
++}
++
++// downloadItem 负责处理单个文件 (照片/实况图/普通视频) 的分析、路径拼接、断点续传检查与下载调用。
++func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin string, photo, album gjson.Result, albumPath string, exclude bool, localFiles map[string]string) error {
++	select {
++	case <-ctx.Done():
++		return nil
++	default:
++	}
++
++	spec := s.buildMediaSpec(photo)
++	sloc := spec.sloc
++	originalName := spec.originalName
++	t := spec.shootTime
++	shootDate := spec.shootDate
++	isVideo := spec.isVideo
++
++	var tasks []mediaTask
++	candidates, videoID, sourceErr := s.resolveMediaCandidates(ctx, targetUin, album, spec, photo)
++	if isVideo {
++		if sourceErr != nil || len(candidates) == 0 {
++			s.results.addFailedItem(s.makeFailedItem(targetUin, album, photo, sloc, sourceErr, true))
+ 			return nil
+ 		}
+-		vidFilename := fmt.Sprintf("VID_%s_%s_%s.mp4", filenameDate[:8], filenameDate[8:], util.MD5(sloc)[8:24])
+ 		tasks = append(tasks, mediaTask{
+-			candidates: source.Candidates,
+-			videoID:    source.VideoID,
+-			filename:   vidFilename,
++			candidates: candidates,
++			videoID:    videoID,
++			filename:   spec.videoName,
+ 			isVideo:    true,
+ 		})
+ 	} else {
+ 		tasks = append(tasks, mediaTask{
+-			candidates: []qzone.VideoCandidate{{URL: imgSource, Kind: "image"}},
+-			filename:   imgFilename,
++			candidates: candidates,
++			filename:   spec.imageName,
+ 			isVideo:    false,
+ 		})
+ 	}
+diff --git a/internal/cli/group.go b/internal/cli/group.go
+index cb00ce6..c75145b 100644
+--- a/internal/cli/group.go
++++ b/internal/cli/group.go
+@@ -165,8 +165,6 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
+ 		c.logger.Warnf("⚠️  群 [%s] 没有相册，或当前账号无权查看", group.DisplayName())
+ 		return c.askStayInGroupPicker("换一个群试试?")
+ 	}
+-	_ = qzone.RememberGroup(c.client.QQ, group)
+-
+ 	exclude, ok := c.askAlbumTaskOptions()
+ 	if !ok {
+ 		return groupFlowPicker
+@@ -177,6 +175,29 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
+ 		return groupFlowPicker
+ 	}
+ 
++	// 写盘前预检：拉完整清单、逐项估算、查目标卷容量，确认前零写入。
++	plannedAlbums := app.SelectAlbums(allAlbums, finalAlbums)
++	plan, planErr := app.NewGroupSpider(c.client, c.config, finalAlbums, group.ID, group.DisplayName(), c.logger).
++		BuildBackupPlan(ctx, c.client.QQ, plannedAlbums, exclude)
++	if planErr != nil {
++		c.logger.Errorf("❌ 备份预检未能完成: %v", planErr)
++		return c.askStayInGroupPicker("换一个群试试?")
++	}
++	if plan.Total == 0 {
++		c.logger.Warn("⚠️ 所选相册没有可备份的媒体，已结束，未创建任务记录或文件。")
++		return c.askStayInGroupPicker("换一个群试试?")
++	}
++	switch c.reviewBackupPlan(plan) {
++	case planRejected:
++		return c.askStayInGroupPicker("目标卷空间不足。清理磁盘或换个目标盘后再来。现在换一个群试试?")
++	case planCancelled:
++		c.logger.Info("🚫 已取消备份：未创建任务记录、目录、临时文件或媒体内容。")
++		return groupFlowPicker
++	}
++
++	// 用户确认后才允许产生副作用：记住群号、任务日志和任务记录都放在预检通过之后。
++	_ = qzone.RememberGroup(c.client.QQ, group)
++
+ 	taskLogger := c.createTaskLogger(c.client.QQ)
+ 	record := app.NewTaskRecord(app.TaskModeGroupAlbum, c.client.QQ, c.client.QQ, finalAlbums, c.config, exclude)
+ 	record.GroupID = group.ID
+@@ -186,7 +207,7 @@ func (c *CLI) backupOneGroup(ctx context.Context, group qzone.Group) int {
+ 	spider := app.NewGroupSpider(c.client, c.config, finalAlbums, group.ID, group.DisplayName(), taskLogger)
+ 
+ 	fmt.Println(color.HiBlackString("\n━━━━━━━━━━━━━━━━━━━━━━ 正在下载群相册 ━━━━━━━━━━━━━━━━━━━━━━"))
+-	results, runErr := spider.Download(ctx, c.client.QQ, exclude)
++	results, runErr := spider.DownloadPlan(ctx, c.client.QQ, plan)
+ 	fmt.Println(color.HiBlackString("━━━━━━━━━━━━━━━━━━━━━━ 下载完成 ━━━━━━━━━━━━━━━━━━━━━━"))
+ 
+ 	status := c.determineTaskStatus(ctx, results, runErr)
+diff --git a/internal/cli/menu.go b/internal/cli/menu.go
+index 4b4f6ad..423f7bf 100644
+--- a/internal/cli/menu.go
++++ b/internal/cli/menu.go
+@@ -436,6 +436,27 @@ func (c *CLI) handleSpider(ctx context.Context, targetUin string) {
+ 		return
+ 	}
+ 
++	// 写盘前预检：拉完整清单、逐项估算、查目标卷容量，确认前零写入。
++	plannedAlbums := app.SelectAlbums(allAlbums, finalAlbums)
++	plan, planErr := app.NewSpider(c.client, c.config, finalAlbums, c.logger).
++		BuildBackupPlan(ctx, targetUin, plannedAlbums, exclude)
++	if planErr != nil {
++		c.logger.Errorf("❌ 备份预检未能完成: %v", planErr)
++		return
++	}
++	if plan.Total == 0 {
++		c.logger.Warn("⚠️ 所选相册没有可备份的媒体，已结束，未创建任务记录或文件。")
++		return
++	}
++	switch c.reviewBackupPlan(plan) {
++	case planRejected:
++		return
++	case planCancelled:
++		c.logger.Info("🚫 已取消备份：未创建任务记录、目录、临时文件或媒体内容。")
++		return
++	}
++
++	// 用户确认后才允许产生副作用：任务日志、任务记录均在此之后创建。
+ 	taskLogger := c.createTaskLogger(targetUin)
+ 	record := app.NewTaskRecord(app.TaskModeBackup, c.client.QQ, targetUin, finalAlbums, c.config, exclude)
+ 	c.saveTaskRecord(record, nil, nil, app.TaskStatusPending)
+@@ -443,7 +464,7 @@ func (c *CLI) handleSpider(ctx context.Context, targetUin string) {
+ 	spider := app.NewSpider(c.client, c.config, finalAlbums, taskLogger)
+ 
+ 	fmt.Println(color.HiBlackString("\n━━━━━━━━━━━━━━━━━━━━━━ 正在下载 ━━━━━━━━━━━━━━━━━━━━━━"))
+-	results, runErr := spider.Download(ctx, targetUin, exclude)
++	results, runErr := spider.DownloadPlan(ctx, targetUin, plan)
+ 	fmt.Println(color.HiBlackString("━━━━━━━━━━━━━━━━━━━━━━ 下载完成 ━━━━━━━━━━━━━━━━━━━━━━"))
+ 
+ 	status := c.determineTaskStatus(ctx, results, runErr)
+diff --git a/internal/cli/precheck.go b/internal/cli/precheck.go
+new file mode 100644
+index 0000000..87d1149
+--- /dev/null
++++ b/internal/cli/precheck.go
+@@ -0,0 +1,75 @@
++// 备份预检报告的终端展示与确认闸门。个人相册和群相册在写盘前共用这一套交互。
++
++package cli
++
++import (
++	"fmt"
++
++	"github.com/AlecAivazis/survey/v2"
++	"github.com/fatih/color"
++	"github.com/qinjintian/qq-zone/internal/app"
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++)
++
++const (
++	planProceed   = iota // 用户确认，按冻结清单开始备份
++	planCancelled        // 用户在确认阶段取消：不留任何任务和文件副作用
++	planRejected         // 已知待写字节超过目标卷可用空间：硬性拒绝
++)
++
++// reviewBackupPlan 展示预检容量账并要求用户明确确认。
++// 空间不足时不给确认机会（planRejected）；存在未知项时会额外警示，但确认后仍可执行。
++func (c *CLI) reviewBackupPlan(plan *app.BackupPlan) int {
++	green := color.New(color.FgGreen).SprintFunc()
++	cyan := color.New(color.FgCyan).SprintFunc()
++	yellow := color.New(color.FgYellow).SprintFunc()
++	red := color.New(color.FgRed, color.Bold).SprintFunc()
++	bold := color.New(color.Bold).SprintFunc()
++	gray := color.New(color.FgWhite, color.Faint).SprintFunc()
++
++	bar := gray("────────────────────────────────────────────────────────────")
++	var out string
++	out += "\n" + bold(cyan("🧾 备份预检报告")) + "  " + gray("（确认前不会创建任务记录、目录或任何文件）") + "\n"
++	out += bar + "\n"
++	out += fmt.Sprintf(" 💽 %-12s %s\n", "目标卷:", cyan(plan.VolumePath))
++	out += fmt.Sprintf(" 📈 %-12s %s  %s\n", "卷可用空间:", green(util.FormatBytes(plan.FreeBytes)), gray("(卷总容量 "+util.FormatBytes(plan.VolumeTotal)+")"))
++	out += fmt.Sprintf(" 🧮 %-12s %s 项\n", "媒体总数:", bold(plan.Total))
++	out += fmt.Sprintf(" 🆕 %-12s %s 项，完整下载需 %s\n", "新下载:", green(plan.NewCount), green(util.FormatBytes(plan.NewBytes)))
++	out += fmt.Sprintf(" ▶️  %-12s %s 项，本地已有 %s，还需写入 %s\n",
++		"可续传:", yellow(plan.ResumeCount),
++		util.FormatBytes(plan.ResumeHaveBytes), yellow(util.FormatBytes(plan.ResumeBytes)))
++	out += fmt.Sprintf(" ⏭️  %-12s %s 项\n", "完整跳过:", yellow(plan.SkipCount))
++	out += fmt.Sprintf(" ❓ %-12s %s 项 %s\n", "大小未知:", yellow(plan.UnknownCount), gray("（HEAD 失败 / HLS / 无可靠长度，不计入下方字节）"))
++	out += bar + "\n"
++	out += fmt.Sprintf(" ⛽ %-12s %s\n", "已知至少写入:", bold(util.FormatBytes(plan.KnownRemaining)))
++
++	if plan.SpaceShortage() {
++		out += "\n" + red("❌ 空间不足，已拒绝执行：") +
++			fmt.Sprintf("\n   已知至少要写入 %s，但目标卷只剩 %s。",
++				red(util.FormatBytes(plan.KnownRemaining)), red(util.FormatBytes(plan.FreeBytes))) +
++			"\n   已在任务记录、目录、临时文件和媒体内容产生之前中止；未知项还可能进一步增加占用。"
++		c.logger.Info(out)
++		return planRejected
++	}
++
++	if plan.UnknownCount > 0 {
++		out += "\n" + yellow("⚠️  存在大小未知的媒体：") +
++			fmt.Sprintf(" %s 项未计入已知字节，实际占用可能高于 %s。", yellow(plan.UnknownCount), util.FormatBytes(plan.KnownRemaining)) +
++			"\n   请确认卷上预留了足够余量；确认后这些项仍会尝试下载。"
++	}
++
++	c.logger.Info(out)
++
++	confirm := false
++	if err := askOne(&survey.Confirm{
++		Message: color.New(color.FgCyan, color.Bold).Sprint(
++			"是否按这份冻结清单开始备份？（确认后只下载清单中的媒体，不会二次拉取加入新照片）"),
++		Default: false,
++	}, &confirm, survey.WithIcons(func(icons *survey.IconSet) {
++		icons.Question.Text = "❓"
++		icons.SelectFocus.Text = "▶"
++	})); err != nil || !confirm {
++		return planCancelled
++	}
++	return planProceed
++}
+diff --git a/internal/net/http/http.go b/internal/net/http/http.go
+index 2bf8bb7..c8586f7 100644
+--- a/internal/net/http/http.go
++++ b/internal/net/http/http.go
+@@ -209,6 +209,144 @@ func (c *Client) Head(ctx context.Context, url string, headers map[string]string
+ 	return resp.Header(), nil
+ }
+ 
++// ProbeSize 在不下载实体的前提下探测媒体的完整字节数，仅供备份预检估算容量使用。
++// 先走 HEAD；HEAD 不被 CDN 支持时再发一次 bytes=0-0 的极简 GET，从 Content-Range 取总长度。
++// 探测本身不写盘，也不走全局限流（与大文件下载同级），任何一步拿不到可靠长度都返回错误，
++// 由调用方把该项计入「大小未知」，不能当作 0 字节。
++func (c *Client) ProbeSize(ctx context.Context, uri string, headers map[string]string) (int64, error) {
++	if strings.TrimSpace(uri) == "" {
++		return 0, fmt.Errorf("probe size: empty url")
++	}
++	probeHeaders := cloneStringMap(headers)
++	// 下载头里可能带 Range: bytes=0-，HEAD/探测请求不能复用，否则长度语义被污染。
++	delete(probeHeaders, "Range")
++
++	size, headErr := c.ProbeSizeHead(ctx, uri, probeHeaders)
++	if headErr == nil && size > 0 {
++		return size, nil
++	}
++
++	rangeSize, rangeErr := c.ProbeSizeRange(ctx, uri, probeHeaders)
++	if rangeErr == nil && rangeSize > 0 {
++		return rangeSize, nil
++	}
++	if headErr == nil {
++		headErr = fmt.Errorf("head: no reliable content length")
++	}
++	return 0, fmt.Errorf("probe size failed; head: %v; range get: %w", headErr, rangeErr)
++}
++
++// ProbeSizeHead 只发一次 HEAD 并取完整长度。它与下载流程中 shouldSkipExisting 的跳过判定依据一致，
++// 预检必须用同一个依据判断「完整跳过」，避免计划与执行结论不一致。
++func (c *Client) ProbeSizeHead(ctx context.Context, uri string, headers map[string]string) (int64, error) {
++	resp, err := c.resty.R().
++		SetContext(ctx).
++		SetHeaders(headers).
++		Head(uri)
++	if err != nil {
++		return 0, err
++	}
++	if resp.IsError() {
++		return 0, &StatusError{Code: resp.StatusCode(), Status: resp.Status()}
++	}
++	if size := reliableContentLength(resp.StatusCode(), resp.Header()); size > 0 {
++		return size, nil
++	}
++	return 0, fmt.Errorf("head: no reliable content length")
++}
++
++// ProbeSizeRange 只发一次 bytes=0-0 的极简 GET，从 206 的 Content-Range 取完整长度。
++// 这与真正下载走的 Range 请求同源，CDN 拒绝 HEAD 时仍能拿到可靠长度。
++func (c *Client) ProbeSizeRange(ctx context.Context, uri string, headers map[string]string) (int64, error) {
++	getHeaders := cloneStringMap(headers)
++	delete(getHeaders, "Range")
++	getHeaders["Range"] = "bytes=0-0"
++	resp, err := c.resty.R().
++		SetContext(ctx).
++		SetHeaders(getHeaders).
++		SetDoNotParseResponse(true).
++		Get(uri)
++	if err != nil {
++		return 0, err
++	}
++	if body := resp.RawBody(); body != nil {
++		_ = body.Close()
++	}
++	if resp.IsError() {
++		return 0, &StatusError{Code: resp.StatusCode(), Status: resp.Status()}
++	}
++	if size := reliableContentLength(resp.StatusCode(), resp.Header()); size > 0 {
++		return size, nil
++	}
++	return 0, fmt.Errorf("range get: no reliable content length")
++}
++
++// reliableContentLength 从响应头里提取媒体的完整长度。
++// 206 必须以 Content-Range 的总长为准（此时 Content-Length 只是本次分片长度，例如 1）；
++// 其余状态取 Content-Length。拿不到可靠正值时返回 0。
++func reliableContentLength(statusCode int, header http.Header) int64 {
++	if statusCode == http.StatusPartialContent {
++		if total, err := parseContentRangeTotal(header.Get("Content-Range")); err == nil && total > 0 {
++			return total
++		}
++	}
++	if raw := strings.TrimSpace(header.Get("Content-Length")); raw != "" {
++		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
++			return n
++		}
++	}
++	return 0
++}
++
++// parseContentRangeTotal 解析 "bytes 0-0/12345" 形式的总长度；实例长度未知（"bytes 0-0/*"）视为失败。
++func parseContentRangeTotal(contentRange string) (int64, error) {
++	if contentRange == "" {
++		return 0, fmt.Errorf("missing Content-Range header")
++	}
++	parts := strings.SplitN(contentRange, " ", 2)
++	if len(parts) != 2 {
++		return 0, fmt.Errorf("malformed Content-Range: %s", contentRange)
++	}
++	rangePart := strings.SplitN(parts[1], "/", 2)
++	if len(rangePart) != 2 {
++		return 0, fmt.Errorf("malformed Content-Range: %s", contentRange)
++	}
++	total := strings.TrimSpace(rangePart[1])
++	if total == "" || total == "*" {
++		return 0, fmt.Errorf("unknown instance length in Content-Range: %s", contentRange)
++	}
++	n, err := strconv.ParseInt(total, 10, 64)
++	if err != nil {
++		return 0, fmt.Errorf("invalid Content-Range total %q: %w", total, err)
++	}
++	return n, nil
++}
++
++// ResumeSidecar 只读返回目标文件当前的续传状态：本地已有字节数、sidecar 记录的源 URL。
++// 预检用它判断半成品能否按同一 URL 续 Range。整个函数不创建、不修改任何文件：
++// 文件不存在返回 (0, "", false)；有半成品但 sidecar 缺失/损坏时 hasURI=false（下载时会作废重下）。
++func ResumeSidecar(target string) (localSize int64, uri string, hasURI bool) {
++	fi, err := os.Stat(target)
++	if err != nil || fi.Size() <= 0 {
++		return 0, "", false
++	}
++	localSize = fi.Size()
++	if meta, loadErr := loadResumeMetadata(resumeMetadataPath(target)); loadErr == nil && meta != nil {
++		if u := strings.TrimSpace(meta.URI); u != "" {
++			return localSize, u, true
++		}
++	}
++	return localSize, "", false
++}
++
++func cloneStringMap(src map[string]string) map[string]string {
++	dst := make(map[string]string, len(src))
++	for k, v := range src {
++		dst[k] = v
++	}
++	return dst
++}
++
+ // PostForm 发起一个 HTTP POST 表单请求，用于提交数据。
+ func (c *Client) PostForm(ctx context.Context, url string, params map[string]string, headers map[string]string) ([]byte, error) {
+ 	if err := c.limiter.Wait(ctx); err != nil {
+diff --git a/internal/net/http/probe_test.go b/internal/net/http/probe_test.go
+new file mode 100644
+index 0000000..90e88a4
+--- /dev/null
++++ b/internal/net/http/probe_test.go
+@@ -0,0 +1,122 @@
++// 预检体积探测与续传 sidecar 只读查询的单元测试
++
++package http
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestProbeSize(t *testing.T) {
++	mux := http.NewServeMux()
++
++	mux.HandleFunc("/head-only", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodHead {
++			t.Errorf("期望 HEAD，实际 %s", r.Method)
++		}
++		w.Header().Set("Content-Length", "1234")
++	})
++
++	mux.HandleFunc("/range-only", func(w http.ResponseWriter, r *http.Request) {
++		switch r.Method {
++		case http.MethodHead:
++			w.WriteHeader(http.StatusMethodNotAllowed)
++		case http.MethodGet:
++			if r.Header.Get("Range") != "bytes=0-0" {
++				w.WriteHeader(http.StatusInternalServerError)
++				return
++			}
++			w.Header().Set("Content-Range", "bytes 0-0/5678")
++			w.Header().Set("Content-Length", "1")
++			w.WriteHeader(http.StatusPartialContent)
++			_, _ = w.Write([]byte("x"))
++		default:
++			w.WriteHeader(http.StatusMethodNotAllowed)
++		}
++	})
++
++	mux.HandleFunc("/no-length", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodHead {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		// 先发送响应头再写实体，强制 chunked 传输，客户端拿不到 Content-Length。
++		w.WriteHeader(http.StatusOK)
++		if flusher, ok := w.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		_, _ = w.Write([]byte("abc"))
++	})
++
++	mux.HandleFunc("/dead", func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNotFound)
++	})
++
++	srv := httptest.NewServer(mux)
++	defer srv.Close()
++
++	client := NewClient()
++	ctx := context.Background()
++
++	size, err := client.ProbeSize(ctx, srv.URL+"/head-only", nil)
++	if err != nil {
++		t.Fatalf("HEAD 直出长度失败: %v", err)
++	}
++	if size != 1234 {
++		t.Fatalf("HEAD 长度错误: got %d want 1234", size)
++	}
++
++	size, err = client.ProbeSize(ctx, srv.URL+"/range-only", nil)
++	if err != nil {
++		t.Fatalf("HEAD 失败后应通过 Range GET 取总长: %v", err)
++	}
++	if size != 5678 {
++		t.Fatalf("Content-Range 总长错误: got %d want 5678", size)
++	}
++
++	if _, err := client.ProbeSize(ctx, srv.URL+"/no-length", nil); err == nil {
++		t.Fatal("无可靠长度时必须返回错误，不能当成 0 字节")
++	}
++
++	if _, err := client.ProbeSize(ctx, srv.URL+"/dead", nil); err == nil {
++		t.Fatal("HEAD 与 Range GET 均 404 时必须返回错误")
++	}
++
++	if _, err := client.ProbeSize(ctx, "", nil); err == nil {
++		t.Fatal("空 URL 必须报错")
++	}
++}
++
++func TestResumeSidecar(t *testing.T) {
++	dir := t.TempDir()
++	target := filepath.Join(dir, "VID_20210101_010101_abcd1234.mp4")
++
++	// 尚不存在：全部零值。
++	if size, uri, ok := ResumeSidecar(target); size != 0 || uri != "" || ok {
++		t.Fatalf("不存在的文件应返回零值, got (%d,%q,%v)", size, uri, ok)
++	}
++
++	// 只有半成品，没有 sidecar：返回本地字节数但 hasURI=false（下载时会作废重下）。
++	if err := os.WriteFile(target, make([]byte, 300), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	size, uri, ok := ResumeSidecar(target)
++	if size != 300 || uri != "" || ok {
++		t.Fatalf("无 sidecar 状态错误: got (%d,%q,%v)", size, uri, ok)
++	}
++
++	// 半成品 + 有效 sidecar：能判定按同一 URL 续传。
++	meta := fmt.Sprintf(`{"uri":"https://cdn.example.com/a.mp4","updated_at":"2026-09-21T00:00:00Z"}`)
++	if err := os.WriteFile(target+".resume.json", []byte(meta), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	size, uri, ok = ResumeSidecar(target)
++	if size != 300 || !ok || uri != "https://cdn.example.com/a.mp4" {
++		t.Fatalf("有 sidecar 状态错误: got (%d,%q,%v)", size, uri, ok)
++	}
++}
+diff --git a/internal/pkg/util/disk.go b/internal/pkg/util/disk.go
+new file mode 100644
+index 0000000..858708c
+--- /dev/null
++++ b/internal/pkg/util/disk.go
+@@ -0,0 +1,41 @@
++// 目标卷可用空间查询。备份预检在创建任何目录之前就要拿到容量，
++// 因此目标路径不存在时要向上找到最近的现存目录，再对所在卷做 Statfs。
++
++package util
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++)
++
++// VolumeFreeSpace 返回 path 所在卷的挂载点（实际用于查询的现存目录）、
++// 普通用户可用字节数和卷总字节数。整个过程只读，不创建任何目录或文件。
++// path 的所有祖先都不存在（例如整份 storage 目录尚未生成）时会回退到当前工作目录。
++func VolumeFreeSpace(path string) (mount string, free, total int64, err error) {
++	abs, absErr := filepath.Abs(path)
++	if absErr != nil {
++		return "", 0, 0, absErr
++	}
++
++	dir := abs
++	for {
++		fi, statErr := os.Stat(dir)
++		if statErr == nil && fi.IsDir() {
++			break
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			// 理论上不会发生（退到根目录一定存在），兜底用当前工作目录所在卷。
++			dir, _ = os.Getwd()
++			break
++		}
++		dir = parent
++	}
++
++	free, total, err = diskFree(dir)
++	if err != nil {
++		return "", 0, 0, fmt.Errorf("查询目录 %s 所在卷容量失败: %w", dir, err)
++	}
++	return dir, free, total, nil
++}
+diff --git a/internal/pkg/util/disk_other.go b/internal/pkg/util/disk_other.go
+new file mode 100644
+index 0000000..85d11a3
+--- /dev/null
++++ b/internal/pkg/util/disk_other.go
+@@ -0,0 +1,17 @@
++//go:build !windows
++
++// 非 Windows 平台通过 statfs 读取卷可用容量。
++
++package util
++
++import "golang.org/x/sys/unix"
++
++func diskFree(path string) (free, total int64, err error) {
++	var st unix.Statfs_t
++	if err = unix.Statfs(path, &st); err != nil {
++		return 0, 0, err
++	}
++	blockSize := int64(st.Bsize)
++	// Bavail 是普通用户（非 root）实际可用块数，比 Bfree 更保守，容量门槛用它才不会误判。
++	return int64(st.Bavail) * blockSize, int64(st.Blocks) * blockSize, nil
++}
+diff --git a/internal/pkg/util/disk_test.go b/internal/pkg/util/disk_test.go
+new file mode 100644
+index 0000000..7567dad
+--- /dev/null
++++ b/internal/pkg/util/disk_test.go
+@@ -0,0 +1,33 @@
++// 目标卷容量查询测试
++
++package util
++
++import (
++	"path/filepath"
++	"testing"
++)
++
++func TestVolumeFreeSpace(t *testing.T) {
++	dir := t.TempDir()
++
++	mount, free, total, err := VolumeFreeSpace(dir)
++	if err != nil {
++		t.Fatalf("查询现存目录容量失败: %v", err)
++	}
++	if mount == "" || free <= 0 || total <= 0 {
++		t.Fatalf("容量字段不合理: mount=%q free=%d total=%d", mount, free, total)
++	}
++	if free > total {
++		t.Fatalf("可用空间 %d 不应大于总容量 %d", free, total)
++	}
++
++	// 尚不存在的深层路径应回退到现存祖先，而不是报错或创建目录。
++	deep := filepath.Join(dir, "not", "created", "yet", "album")
++	mount2, free2, _, err := VolumeFreeSpace(deep)
++	if err != nil {
++		t.Fatalf("不存在路径回退失败: %v", err)
++	}
++	if mount2 != mount || free2 != free {
++		t.Fatalf("回退祖先 (%q,%d) 与现存目录 (%q,%d) 结果不一致", mount2, free2, mount, free)
++	}
++}
+diff --git a/internal/pkg/util/disk_windows.go b/internal/pkg/util/disk_windows.go
+new file mode 100644
+index 0000000..c44f8fb
+--- /dev/null
++++ b/internal/pkg/util/disk_windows.go
+@@ -0,0 +1,23 @@
++//go:build windows
++
++// Windows 平台通过 GetDiskFreeSpaceEx 读取卷可用容量。
++
++package util
++
++import "golang.org/x/sys/windows"
++
++func diskFree(path string) (free, total int64, err error) {
++	pathPtr, err := windows.UTF16PtrFromString(path)
++	if err != nil {
++		return 0, 0, err
++	}
++	var (
++		freeAvailable uint64
++		totalBytes    uint64
++		totalFree     uint64
++	)
++	if err = windows.GetDiskFreeSpaceEx(pathPtr, &freeAvailable, &totalBytes, &totalFree); err != nil {
++		return 0, 0, err
++	}
++	return int64(freeAvailable), int64(totalBytes), nil
++}
