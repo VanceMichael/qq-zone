@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -286,9 +287,18 @@ func (c *CLI) Menu(ctx context.Context) {
 	}
 }
 
-// ensureLogin 验证当前客户端是否已登录，若未登录则触发账号管理/扫码流程
+// ensureLogin 验证当前客户端是否已登录，若未登录则触发账号管理/扫码流程。
+// 会话文件损坏/不可读时停止账号选择且绝不弹新二维码；只有空间明确判定凭证失效
+// 的账号才会被删除并引导重新扫码；其它暂时故障保留原凭证，提示稍后重试或重选。
 func (c *CLI) ensureLogin(ctx context.Context) error {
-	sessions, _ := qzone.LoadSessions()
+	sessions, err := qzone.LoadSessions()
+	if err != nil {
+		// 存储问题必须停下来：既不能当成空账号库弹二维码，也不能让后续写入覆盖原文件。
+		c.logger.Errorf("❌ 本地会话文件不可用（%s），已停止账号选择，历史账号未被改动", qzone.SessionPath)
+		c.logger.Errorf("   原因: %v", err)
+		c.logger.Info("请检查/修复该文件（或手动移除后重试）。")
+		return err
+	}
 
 	if len(sessions) == 0 {
 		return c.loginNew(ctx)
@@ -346,8 +356,25 @@ func (c *CLI) ensureLogin(ctx context.Context) error {
 	c.logger.Infof("📡 正在校验账号 [%s] 的登录状态...", sess.Nickname)
 	client, err := qzone.NewClientWithSession(ctx, sess, c.http, c.logFact)
 	if err != nil {
-		c.logger.Warnf("⚠️  账号 [%s] 登录已失效，请重新扫码", sess.Nickname)
-		return c.loginNew(ctx)
+		switch {
+		case qzone.IsCredentialInvalid(err):
+			// 只有 QQ 空间明确判定凭证失效，本地账号才已被删除，此时才引导重新扫码。
+			c.logger.Warnf("⚠️  账号 [%s] 的登录凭证已被 QQ 空间判定失效，本地记录已删除: %v", sess.Nickname, err)
+			return c.loginNew(ctx)
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), ctx.Err() != nil:
+			// 用户取消 / 中断：安静返回主菜单，凭证保留。
+			c.logger.Warnf("⚠️  账号 [%s] 的校验已取消，本地凭证已保留，可稍后重试或重选账号", sess.Nickname)
+		case qzone.IsSessionStorageError(err):
+			c.logger.Errorf("❌ 账号 [%s] 凭证有效，但本地会话存储失败，原文件已保留、未删除任何账号", sess.Nickname)
+			c.logger.Errorf("   原因: %v", err)
+			c.logger.Info("请检查会话文件/磁盘后重试。")
+		default:
+			// 网络失败、限流、5xx、非预期响应或解析失败：凭证保留，绝不弹新二维码。
+			c.logger.Errorf("⚠️  暂时无法校验账号 [%s]，本地凭证已完整保留（未删除账号、未弹出新二维码）", sess.Nickname)
+			c.logger.Errorf("   原因: %v", err)
+			c.logger.Info("请检查网络后稍后重试，或返回重新选择账号。")
+		}
+		return err
 	}
 
 	return c.setupClient(client)
@@ -358,7 +385,14 @@ func (c *CLI) loginNew(ctx context.Context) error {
 	c.logger.Info("正在准备登录，请扫描弹出的二维码...")
 	client, err := qzone.NewClientWithQR(ctx, c.http, c.logFact)
 	if err != nil {
-		c.logger.Errorf("❌ 登录失败: %v", err)
+		if qzone.IsSessionStorageError(err) {
+			// 扫码本身成功了，但会话没能落盘：不算完成登录，原会话文件已保留。
+			c.logger.Errorf("❌ 扫码成功，但本地会话保存失败，未完成登录，原文件已保留: %v", err)
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			c.logger.Warn("⚠️  已取消扫码登录")
+		} else {
+			c.logger.Errorf("❌ 登录失败: %v", err)
+		}
 		return err
 	}
 	return c.setupClient(client)

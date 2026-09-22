@@ -96,7 +96,10 @@ func (c *CLI) loadRemoteGroups(ctx context.Context) ([]qzone.Group, bool) {
 	}
 	if qzone.IsQunAuthError(err) {
 		c.logger.Info("完整群列表的授权过期了，空间登录还在。下面先列出本机用过的群。")
-		c.client.ClearQunAuth()
+		if err := c.client.ClearQunAuth(); err != nil {
+			// 内存态已清，只是本地文件没同步成功；提示但不阻断后续手动选群。
+			c.logger.Warnf("⚠️  清除本地群授权记录失败（不影响本次使用）: %v", err)
+		}
 		return nil, false
 	}
 	c.logger.Warnf("⚠️  完整群列表暂时拉不下来: %v", err)

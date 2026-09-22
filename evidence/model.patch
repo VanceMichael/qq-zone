@@ -1,0 +1,1047 @@
+diff --git a/internal/cli/group.go b/internal/cli/group.go
+index cb00ce6..07deee1 100644
+--- a/internal/cli/group.go
++++ b/internal/cli/group.go
+@@ -96,7 +96,10 @@ func (c *CLI) loadRemoteGroups(ctx context.Context) ([]qzone.Group, bool) {
+ 	}
+ 	if qzone.IsQunAuthError(err) {
+ 		c.logger.Info("完整群列表的授权过期了，空间登录还在。下面先列出本机用过的群。")
+-		c.client.ClearQunAuth()
++		if err := c.client.ClearQunAuth(); err != nil {
++			// 内存态已清，只是本地文件没同步成功；提示但不阻断后续手动选群。
++			c.logger.Warnf("⚠️  清除本地群授权记录失败（不影响本次使用）: %v", err)
++		}
+ 		return nil, false
+ 	}
+ 	c.logger.Warnf("⚠️  完整群列表暂时拉不下来: %v", err)
+diff --git a/internal/cli/menu.go b/internal/cli/menu.go
+index 4b4f6ad..4c66ac2 100644
+--- a/internal/cli/menu.go
++++ b/internal/cli/menu.go
+@@ -4,6 +4,7 @@ package cli
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/signal"
+@@ -286,9 +287,18 @@ func (c *CLI) Menu(ctx context.Context) {
+ 	}
+ }
+ 
+-// ensureLogin 验证当前客户端是否已登录，若未登录则触发账号管理/扫码流程
++// ensureLogin 验证当前客户端是否已登录，若未登录则触发账号管理/扫码流程。
++// 会话文件损坏/不可读时停止账号选择且绝不弹新二维码；只有空间明确判定凭证失效
++// 的账号才会被删除并引导重新扫码；其它暂时故障保留原凭证，提示稍后重试或重选。
+ func (c *CLI) ensureLogin(ctx context.Context) error {
+-	sessions, _ := qzone.LoadSessions()
++	sessions, err := qzone.LoadSessions()
++	if err != nil {
++		// 存储问题必须停下来：既不能当成空账号库弹二维码，也不能让后续写入覆盖原文件。
++		c.logger.Errorf("❌ 本地会话文件不可用（%s），已停止账号选择，历史账号未被改动", qzone.SessionPath)
++		c.logger.Errorf("   原因: %v", err)
++		c.logger.Info("请检查/修复该文件（或手动移除后重试）。")
++		return err
++	}
+ 
+ 	if len(sessions) == 0 {
+ 		return c.loginNew(ctx)
+@@ -346,8 +356,25 @@ func (c *CLI) ensureLogin(ctx context.Context) error {
+ 	c.logger.Infof("📡 正在校验账号 [%s] 的登录状态...", sess.Nickname)
+ 	client, err := qzone.NewClientWithSession(ctx, sess, c.http, c.logFact)
+ 	if err != nil {
+-		c.logger.Warnf("⚠️  账号 [%s] 登录已失效，请重新扫码", sess.Nickname)
+-		return c.loginNew(ctx)
++		switch {
++		case qzone.IsCredentialInvalid(err):
++			// 只有 QQ 空间明确判定凭证失效，本地账号才已被删除，此时才引导重新扫码。
++			c.logger.Warnf("⚠️  账号 [%s] 的登录凭证已被 QQ 空间判定失效，本地记录已删除: %v", sess.Nickname, err)
++			return c.loginNew(ctx)
++		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), ctx.Err() != nil:
++			// 用户取消 / 中断：安静返回主菜单，凭证保留。
++			c.logger.Warnf("⚠️  账号 [%s] 的校验已取消，本地凭证已保留，可稍后重试或重选账号", sess.Nickname)
++		case qzone.IsSessionStorageError(err):
++			c.logger.Errorf("❌ 账号 [%s] 凭证有效，但本地会话存储失败，原文件已保留、未删除任何账号", sess.Nickname)
++			c.logger.Errorf("   原因: %v", err)
++			c.logger.Info("请检查会话文件/磁盘后重试。")
++		default:
++			// 网络失败、限流、5xx、非预期响应或解析失败：凭证保留，绝不弹新二维码。
++			c.logger.Errorf("⚠️  暂时无法校验账号 [%s]，本地凭证已完整保留（未删除账号、未弹出新二维码）", sess.Nickname)
++			c.logger.Errorf("   原因: %v", err)
++			c.logger.Info("请检查网络后稍后重试，或返回重新选择账号。")
++		}
++		return err
+ 	}
+ 
+ 	return c.setupClient(client)
+@@ -358,7 +385,14 @@ func (c *CLI) loginNew(ctx context.Context) error {
+ 	c.logger.Info("正在准备登录，请扫描弹出的二维码...")
+ 	client, err := qzone.NewClientWithQR(ctx, c.http, c.logFact)
+ 	if err != nil {
+-		c.logger.Errorf("❌ 登录失败: %v", err)
++		if qzone.IsSessionStorageError(err) {
++			// 扫码本身成功了，但会话没能落盘：不算完成登录，原会话文件已保留。
++			c.logger.Errorf("❌ 扫码成功，但本地会话保存失败，未完成登录，原文件已保留: %v", err)
++		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
++			c.logger.Warn("⚠️  已取消扫码登录")
++		} else {
++			c.logger.Errorf("❌ 登录失败: %v", err)
++		}
+ 		return err
+ 	}
+ 	return c.setupClient(client)
+diff --git a/internal/qzone/client.go b/internal/qzone/client.go
+index 72cb910..57da36e 100644
+--- a/internal/qzone/client.go
++++ b/internal/qzone/client.go
+@@ -6,6 +6,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"strings"
+ 	"time"
+@@ -28,21 +29,32 @@ type Client struct {
+ 	APILogger *zap.SugaredLogger // 专门用于记录 API 请求和响应的日志记录器
+ }
+ 
+-// NewClient 初始化并返回一个 QQ 空间 API 客户端实例 (优先尝试 Session，无效则扫码登录)
++// NewClient 初始化并返回一个 QQ 空间 API 客户端实例 (优先尝试 Session，仅在凭证被明确判定失效时才扫码登录)
+ func NewClient(ctx context.Context, httpClient *http.Client, logFact *logger.Factory) (*Client, error) {
+-	// 1. 尝试从本地加载最近使用的 Session
+-	if sess, err := GetLastSession(); err == nil && sess != nil {
++	// 1. 尝试从本地加载最近使用的 Session；存储故障必须直接上报，不能当成空库去扫码并覆盖原文件。
++	sess, err := GetLastSession()
++	if err != nil {
++		return nil, err
++	}
++	if sess != nil {
+ 		c, err := NewClientWithSession(ctx, sess, httpClient, logFact)
+ 		if err == nil {
+ 			return c, nil
+ 		}
++		// 只有 QQ 空间明确判定凭证失效时，才退回扫码登录；
++		// 暂时故障（取消/网络/限流/5xx/解析失败）或存储错误都要保留账号并把错误交出去。
++		if !IsCredentialInvalid(err) {
++			return nil, err
++		}
+ 	}
+-	// 2. 无效或不存在，执行新登录流程
++	// 2. 不存在历史账号或凭证明确失效，执行新登录流程
+ 	return NewClientWithQR(ctx, httpClient, logFact)
+ }
+ 
+-// NewClientWithSession 从已有的 Session 实例化一个客户端实例
+-// 校验 Session 是否有效，若无效则清理掉该账号的 Session
++// NewClientWithSession 从已有的 Session 实例化一个客户端实例，并在线校验登录态。
++// 仅当 QQ 空间明确返回凭证失效时才删除该账号；context 取消、网络失败、限流、5xx、
++// 非预期响应或解析失败一律保留原凭证并返回可观察错误，由调用方提示稍后重试或重选账号。
++// 校验通过后只在持久化成功时刷新最近使用时间，群授权和其他账号的内容原样保留。
+ func NewClientWithSession(ctx context.Context, sess *Session, httpClient *http.Client, logFact *logger.Factory) (*Client, error) {
+ 	apiLogger, _ := logFact.CreateAPILogger(sess.QQ)
+ 	c := &Client{
+@@ -54,13 +66,24 @@ func NewClientWithSession(ctx context.Context, sess *Session, httpClient *http.C
+ 		Http:      httpClient,
+ 		APILogger: apiLogger,
+ 	}
+-	// 校验 Session 是否有效
+-	if _, err := c.GetAlbumList(ctx, sess.QQ); err != nil {
+-		_ = RemoveSession(sess.QQ) // Session 失效，清理掉该账号
++
++	if err := c.CheckLogin(ctx); err != nil {
++		if IsCredentialInvalid(err) {
++			// QQ 空间明确判定凭证失效：只删除当前选中的这一个账号，再引导用户重新扫码。
++			if rmErr := RemoveSession(sess.QQ); rmErr != nil {
++				return nil, fmt.Errorf("%w；同时本地失效账号删除失败，已停止以保护会话文件: %v", err, rmErr)
++			}
++			return nil, err
++		}
++		// 其它失败一律保留原凭证，绝不能删账号或弹出新二维码。
+ 		return nil, err
+ 	}
+-	// 有效则更新最后使用时间
+-	_ = SaveSession(sess)
++
++	// 校验通过：仅刷新最近使用时间（群授权、其他账号全部保留）。
++	// 持久化失败时必须返回错误，旧文件已原子保留，不能伪装成已完成登录。
++	if err := TouchSession(sess.QQ); err != nil {
++		return nil, fmt.Errorf("账号凭证校验通过，但本地会话刷新失败（旧文件已保留）: %w", err)
++	}
+ 	return c, nil
+ }
+ 
+@@ -88,7 +111,11 @@ func NewClientWithQR(ctx context.Context, httpClient *http.Client, logFact *logg
+ 		APILogger: apiLogger,
+ 	}
+ 
+-	c.persistSession()
++	// 只有会话成功落盘才算完成登录；存储故障（如会话文件损坏）时必须报错，
++	// 不能伪装成登录成功。
++	if err := c.persistSession(); err != nil {
++		return nil, fmt.Errorf("登录成功，但本地会话保存失败，未完成登录（旧会话文件已保留）: %w", err)
++	}
+ 
+ 	return c, nil
+ }
+@@ -112,12 +139,13 @@ func (c *Client) HasQunAuth() bool {
+ }
+ 
+ // ClearQunAuth 丢掉过期的群列表授权，空间登录不受影响。
+-func (c *Client) ClearQunAuth() {
++// 内存态无论是否落盘成功都会清掉；返回 error 表示本地文件没能同步，旧文件保持原样。
++func (c *Client) ClearQunAuth() error {
+ 	if c == nil {
+-		return
++		return nil
+ 	}
+ 	c.QunCookie = ""
+-	c.persistSession()
++	return c.persistSession()
+ }
+ 
+ // AuthorizeQun 弹出群管理页二维码。必须用当前空间登录的同一个 QQ。
+@@ -138,15 +166,18 @@ func (c *Client) AuthorizeQun(ctx context.Context) error {
+ 		return fmt.Errorf("没有拿到群列表凭证，请再扫一次")
+ 	}
+ 	c.QunCookie = cookie
+-	c.persistSession()
++	// 授权在当前进程内已生效；落盘失败必须告诉调用方，不能假装下次也免扫码。
++	if err := c.persistSession(); err != nil {
++		return fmt.Errorf("群授权成功，但本地会话保存失败（旧会话文件已保留，下次可能需要重新授权）: %w", err)
++	}
+ 	return nil
+ }
+ 
+-func (c *Client) persistSession() {
++func (c *Client) persistSession() error {
+ 	if c == nil || strings.TrimSpace(c.QQ) == "" {
+-		return
++		return nil
+ 	}
+-	_ = SaveSession(&Session{
++	return SaveSession(&Session{
+ 		QQ:        c.QQ,
+ 		Nickname:  c.Nickname,
+ 		GTK:       c.GTK,
+@@ -155,6 +186,212 @@ func (c *Client) persistSession() {
+ 	})
+ }
+ 
++// CredentialInvalidError 表示 QQ 空间明确返回登录凭证已失效：
++// 要么是明确的登录失效业务码，要么是被跳转到了登录页。
++// 只有命中这一类错误，才允许删除本地账号并引导重新扫码。
++type CredentialInvalidError struct {
++	Reason string
++}
++
++func (e *CredentialInvalidError) Error() string {
++	if e == nil || e.Reason == "" {
++		return "QQ 空间登录凭证已失效，需要重新扫码登录"
++	}
++	return "QQ 空间登录凭证已失效（" + e.Reason + "），需要重新扫码登录"
++}
++
++// IsCredentialInvalid 判断错误是否为“空间明确判定凭证失效”。
++func IsCredentialInvalid(err error) bool {
++	var target *CredentialInvalidError
++	return errors.As(err, &target)
++}
++
++// TemporaryLoginError 表示登录态校验暂时无法完成：
++// context 取消/超时、网络失败、限流、5xx、非预期响应或解析失败。
++// 凭证并未被判定失效，本地记录必须原样保留，用户可以稍后重试或重选账号。
++type TemporaryLoginError struct {
++	Reason string
++	Cause  error
++}
++
++func (e *TemporaryLoginError) Error() string {
++	if e == nil {
++		return "登录态校验暂时无法完成"
++	}
++	if e.Cause != nil {
++		return "登录态校验暂时无法完成（" + e.Reason + "）: " + e.Cause.Error()
++	}
++	return "登录态校验暂时无法完成（" + e.Reason + "），本地凭证已保留，请稍后重试或重选账号"
++}
++
++func (e *TemporaryLoginError) Unwrap() error {
++	if e == nil {
++		return nil
++	}
++	return e.Cause
++}
++
++// IsTemporaryLoginError 判断错误是否为“暂时无法校验、凭证已保留”。
++func IsTemporaryLoginError(err error) bool {
++	var target *TemporaryLoginError
++	return errors.As(err, &target)
++}
++
++// CheckLogin 用一次相册列表请求在线校验当前凭证是否仍被 QQ 空间认可。
++// 返回 nil 表示有效；返回 CredentialInvalidError 表示空间明确要求重新登录；
++// 其它情况一律包装成 TemporaryLoginError，调用方必须保留本地凭证。
++func (c *Client) CheckLogin(ctx context.Context) error {
++	_, err := c.GetAlbumList(ctx, c.QQ)
++	return classifyLoginCheckError(ctx, err)
++}
++
++// loginExpiredBizCodes 是 QQ 空间各 CGI 明确表示“登录已失效/请先登录”的业务码，
++// 与 moodAPIError / boardAPIError 中的判定保持一致。
++var loginExpiredBizCodes = map[int64]struct{}{
++	-3000:  {},
++	-4001:  {},
++	-87998: {},
++}
++
++// loginExpiredKeywords 是空间业务消息里明确要求重新登录的文案。
++var loginExpiredKeywords = []string{
++	"请先登录",
++	"未登录",
++	"登录已失效",
++	"登录态失效",
++	"登录态过期",
++	"登录过期",
++	"需要登录",
++	"重新登录",
++}
++
++// classifyLoginCheckError 把相册列表请求的失败分成三类：
++// 明确失效（CredentialInvalidError）、暂时故障（TemporaryLoginError）和成功（nil）。
++// 默认按暂时故障处理，宁可让用户稍后重试，也不能误删仍然有效的凭证。
++func classifyLoginCheckError(ctx context.Context, err error) error {
++	if err == nil {
++		return nil
++	}
++
++	// context 取消/超时最先判定：一定是暂时故障；用 Join 保留取消原因与原始错误链。
++	if ctxErr := ctx.Err(); ctxErr != nil {
++		return &TemporaryLoginError{Reason: "校验被取消或等待超时", Cause: errors.Join(err, ctxErr)}
++	}
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return &TemporaryLoginError{Reason: "校验被取消或等待超时", Cause: err}
++	}
++
++	var ae *albumAPIError
++	if errors.As(err, &ae) {
++		// 1) 空间明确的登录失效业务码。
++		if ae.hasBiz {
++			if _, ok := loginExpiredBizCodes[ae.bizCode]; ok {
++				return &CredentialInvalidError{Reason: fmt.Sprintf("空间业务码 %d: %s", ae.bizCode, ae.bizMsg)}
++			}
++			if containsAny(ae.bizMsg, loginExpiredKeywords) {
++				return &CredentialInvalidError{Reason: ae.bizMsg}
++			}
++		}
++		// 2) Cookie 失效后被重定向到登录页（跟随跳转后拿到的是登录页 HTML）。
++		if looksLikeLoginPage(ae.body) {
++			return &CredentialInvalidError{Reason: "空间响应跳转到了登录页面"}
++		}
++		// 3) 其余一律视为暂时故障：限流、5xx、其它 4xx、网络错误、非预期响应/解析失败。
++		switch ae.kind {
++		case albumErrNetwork:
++			return &TemporaryLoginError{Reason: "网络请求失败或连接中断", Cause: err}
++		case albumErrStatus:
++			switch {
++			case ae.httpCode == 429:
++				return &TemporaryLoginError{Reason: "请求被限流 (HTTP 429)", Cause: err}
++			case ae.httpCode >= 500:
++				return &TemporaryLoginError{Reason: fmt.Sprintf("空间服务暂时异常 (HTTP %d)", ae.httpCode), Cause: err}
++			default:
++				return &TemporaryLoginError{Reason: fmt.Sprintf("校验请求被拒绝 (HTTP %d)", ae.httpCode), Cause: err}
++			}
++		default:
++			// 解析失败 / 未知业务码等非预期响应：保留凭证，稍后重试。
++			return &TemporaryLoginError{Reason: "空间返回了非预期响应或响应解析失败", Cause: err}
++		}
++	}
++
++	// 非相册接口错误（底层网络错误等）：保守按暂时故障处理。
++	return &TemporaryLoginError{Reason: "网络请求失败", Cause: err}
++}
++
++func containsAny(s string, keywords []string) bool {
++	for _, k := range keywords {
++		if strings.Contains(s, k) {
++			return true
++		}
++	}
++	return false
++}
++
++// looksLikeLoginPage 判断响应体是否为 QQ 登录页 HTML。仅在确认是 HTML 且包含
++// 登录站点特征时才判定为凭证失效，避免把普通风控页误判成失效。
++func looksLikeLoginPage(body string) bool {
++	if !cgiLooksLikeHTML(body) {
++		return false
++	}
++	lower := strings.ToLower(body)
++	if strings.Contains(lower, "ptlogin") ||
++		strings.Contains(lower, "xui.ptlogin") ||
++		strings.Contains(lower, "idlogin") ||
++		strings.Contains(lower, "qrcodelogin") {
++		return true
++	}
++	return strings.Contains(body, "请先登录") ||
++		strings.Contains(body, "安全登录") ||
++		strings.Contains(body, "一键登录") ||
++		strings.Contains(body, "统一登录")
++}
++
++// albumAPIError 携带一次相册列表请求失败的完整上下文，供登录态分类使用，
++// 同时保持与历史错误文案兼容。
++type albumAPIError struct {
++	page     int            // 第几页请求（从 1 开始）
++	kind     albumErrorKind // 失败环节
++	httpCode int            // HTTP 状态码；0 表示请求未拿到响应
++	hasBiz   bool           // 是否拿到了空间业务码
++	bizCode  int64          // 空间业务码
++	bizMsg   string         // 空间业务消息
++	body     string         // 原始响应体
++	cause    error          // 底层错误（网络/解析）
++}
++
++type albumErrorKind int
++
++const (
++	albumErrNetwork albumErrorKind = iota // 请求未完成（取消/网络/限流等待）
++	albumErrStatus                        // 拿到非 200 HTTP 状态
++	albumErrParse                         // 响应体无法解析
++	albumErrBiz                           // 空间返回非 0 业务码
++)
++
++func (e *albumAPIError) Error() string {
++	if e == nil {
++		return ""
++	}
++	switch e.kind {
++	case albumErrBiz:
++		return fmt.Sprintf("api error (code: %d): %s", e.bizCode, e.bizMsg)
++	case albumErrParse:
++		return fmt.Sprintf("failed to parse album response: %v (raw body: %s)", e.cause, e.body)
++	case albumErrStatus:
++		return fmt.Sprintf("failed to fetch album page %d: status code %d", e.page, e.httpCode)
++	default:
++		return fmt.Sprintf("failed to fetch album page %d: %v", e.page, e.cause)
++	}
++}
++
++func (e *albumAPIError) Unwrap() error {
++	if e == nil {
++		return nil
++	}
++	return e.cause
++}
++
+ // logAPI 负责统一记录底层 API 请求的调试信息
+ // 包含请求的 URL、状态码以及原始的响应内容，方便在出现风控或错误时进行排查
+ func (c *Client) logAPI(apiName, url string, headers map[string]string, body string, statusCode int, duration time.Duration, err error) {
+@@ -229,25 +466,35 @@ func (c *Client) GetAlbumList(ctx context.Context, targetUin string) ([]gjson.Re
+ 		bodyStr := string(body)
+ 		c.logAPI("GetAlbumList", apiURL, headers, bodyStr, code, duration, err)
+ 
++		pageNo := int(offset/limit + 1)
+ 		if err != nil {
+-			return nil, fmt.Errorf("failed to fetch album page %d: %w", offset/limit+1, err)
++			return nil, &albumAPIError{page: pageNo, kind: albumErrNetwork, cause: err}
+ 		}
+ 		if code != 200 {
+-			return nil, fmt.Errorf("failed to fetch album page %d: status code %d", offset/limit+1, code)
++			return nil, &albumAPIError{page: pageNo, kind: albumErrStatus, httpCode: code, body: bodyStr,
++				cause: fmt.Errorf("status code %d", code)}
+ 		}
+ 
+ 		data, err := parseJSONP(bodyStr, "shine_Callback")
+ 		if err != nil {
+-			return nil, fmt.Errorf("failed to parse album response: %w (raw body: %s)", err, bodyStr)
++			return nil, &albumAPIError{page: pageNo, kind: albumErrParse, httpCode: code, body: bodyStr, cause: err}
+ 		}
+ 
+ 		res := gjson.Parse(data)
+-		if code := res.Get("code").Int(); code != 0 {
++		if bizCode := res.Get("code").Int(); bizCode != 0 {
+ 			msg := res.Get("message").String()
+ 			if msg == "" {
+ 				msg = res.Get("msg").String()
+ 			}
+-			return nil, fmt.Errorf("api error (code: %d): %s", code, msg)
++			return nil, &albumAPIError{
++				page:     pageNo,
++				kind:     albumErrBiz,
++				httpCode: code,
++				hasBiz:   true,
++				bizCode:  bizCode,
++				bizMsg:   msg,
++				body:     bodyStr,
++			}
+ 		}
+ 
+ 		albumList := res.Get("data.albumList").Array()
+diff --git a/internal/qzone/session.go b/internal/qzone/session.go
+index f4acf32..0ec86b5 100644
+--- a/internal/qzone/session.go
++++ b/internal/qzone/session.go
+@@ -4,15 +4,22 @@ package qzone
+ 
+ import (
+ 	"encoding/json"
++	"errors"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
++	"strings"
+ 	"time"
+ )
+ 
+ var (
+ 	// SessionPath 定义了多账号会话信息的持久化文件路径
+ 	SessionPath = "storage/sessions.json"
++
++	// ErrSessionStorage 表示会话文件本身不可读或内容损坏。
++	// 命中该错误时必须停止账号选择和新会话写入，绝不允许把它当成空账号库覆盖原文件。
++	ErrSessionStorage = errors.New("本地会话存储异常")
+ )
+ 
+ // Session 记录了单个账号登录状态的核心凭证与信息
+@@ -25,32 +32,82 @@ type Session struct {
+ 	LastUsed  time.Time `json:"last_used"`            // 最后一次使用的时间
+ }
+ 
+-// LoadSessions 从本地 session.json，返回当前存储的所有历史账号信息
++// SessionStorageError 携带会话存储故障的具体环节，便于上层向用户展示可观察的错误。
++type SessionStorageError struct {
++	Op   string // 正在执行的操作，如 读取/解析/写入
++	Path string // 出问题的文件路径
++	Err  error  // 底层错误
++}
++
++func (e *SessionStorageError) Error() string {
++	if e == nil {
++		return ErrSessionStorage.Error()
++	}
++	return fmt.Sprintf("%s: %s会话文件 %s 失败: %v", ErrSessionStorage, e.Op, e.Path, e.Err)
++}
++
++func (e *SessionStorageError) Unwrap() error {
++	if e == nil {
++		return nil
++	}
++	return e.Err
++}
++
++// Is 让 errors.Is(err, ErrSessionStorage) 成立，同时 Unwrap 保留底层原因。
++func (e *SessionStorageError) Is(target error) bool {
++	return target == ErrSessionStorage
++}
++
++// IsSessionStorageError 判断错误是否源自会话存储层（文件不可读、内容损坏、写入失败等）。
++func IsSessionStorageError(err error) bool {
++	return errors.Is(err, ErrSessionStorage)
++}
++
++// LoadSessions 从本地 sessions.json 读取当前存储的所有历史账号信息。
++// 文件尚不存在（首次使用）时返回空 map 与 nil；文件不可读或内容损坏时返回
++// ErrSessionStorage，调用方必须停止后续选择/写入，不能把它当成空账号库。
+ func LoadSessions() (map[string]*Session, error) {
+ 	sessions := make(map[string]*Session)
+ 
+-	// 尝试加载新的多账号 sessions.json
+ 	data, err := os.ReadFile(SessionPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+ 			return sessions, nil
+ 		}
+-		return nil, err
++		return nil, &SessionStorageError{Op: "读取", Path: SessionPath, Err: err}
+ 	}
+ 
+ 	if err := json.Unmarshal(data, &sessions); err != nil {
+-		return nil, err
++		return nil, &SessionStorageError{Op: "解析", Path: SessionPath, Err: err}
++	}
++
++	// 存在 null 条目或缺少账号标识说明文件已损坏，直接报错而不是带着脏数据继续，
++	// 否则后续渲染账号列表会 panic，或在保存时悄悄丢掉这些条目。
++	for qq, s := range sessions {
++		if s == nil {
++			return nil, &SessionStorageError{Op: "解析", Path: SessionPath,
++				Err: fmt.Errorf("账号 %s 的记录为空", qq)}
++		}
++		if strings.TrimSpace(s.QQ) == "" {
++			s.QQ = qq // 历史文件可能只写了 map key，容错补上而不是判废
++		}
+ 	}
+ 
+ 	return sessions, nil
+ }
+ 
+-// SaveSession 将当前最新提取到的登录凭证安全地写入到本地存储文件中
+-// 支持自动合并已有会话，并刷新 LastUsed 时间戳
++// SaveSession 将当前最新提取到的登录凭证写入本地存储文件。
++// 会合并已有会话（保留其他账号的全部内容），并刷新本次写入账号的 LastUsed。
++// 当现有会话文件不可读或损坏时直接返回错误，绝不用空账号库覆盖原文件；
++// 写入采用临时文件 + 原子替换，保存失败时旧文件原样保留。
+ func SaveSession(s *Session) error {
+-	sessions, _ := LoadSessions()
+-	if sessions == nil {
+-		sessions = make(map[string]*Session)
++	if s == nil || strings.TrimSpace(s.QQ) == "" {
++		return errors.New("无法保存会话：缺少账号标识")
++	}
++
++	sessions, err := LoadSessions()
++	if err != nil {
++		return err
+ 	}
+ 
+ 	s.LastUsed = time.Now()
+@@ -59,6 +116,30 @@ func SaveSession(s *Session) error {
+ 	return saveSessionsToFile(sessions)
+ }
+ 
++// TouchSession 仅把指定账号的最近使用时间刷新为当前时刻。
++// 该账号的群授权（QunCookie）以及其他账号的全部内容都原样保留；
++// 只有原子写入成功后刷新才会生效，写入失败时旧文件保持不变并返回错误。
++func TouchSession(qq string) error {
++	qq = strings.TrimSpace(qq)
++	if qq == "" {
++		return errors.New("无法刷新会话：缺少账号标识")
++	}
++
++	sessions, err := LoadSessions()
++	if err != nil {
++		return err
++	}
++
++	s, ok := sessions[qq]
++	if !ok || s == nil {
++		// 账号已被主动清理时无需刷新，不算存储故障。
++		return nil
++	}
++	s.LastUsed = time.Now()
++
++	return saveSessionsToFile(sessions)
++}
++
+ // GetLastSession 从本地存储中提取出最新使用（或最后更新）的活跃会话
+ func GetLastSession() (*Session, error) {
+ 	sessions, err := LoadSessions()
+@@ -97,46 +178,76 @@ func RemoveSession(qq string) error {
+ func ClearSession() error {
+ 	s, err := GetLastSession()
+ 	if err != nil || s == nil {
+-		return nil
++		return err
+ 	}
+ 	return RemoveSession(s.QQ)
+ }
+ 
+ // SetActiveSession 标记指定的 QQ 号为当前激活状态(最新使用)
+ func SetActiveSession(qq string) error {
+-	sessions, err := LoadSessions()
+-	if err != nil {
+-		return err
+-	}
+-
+-	if s, ok := sessions[qq]; ok {
+-		s.LastUsed = time.Now()
+-		return saveSessionsToFile(sessions)
+-	}
+-
+-	return nil
++	return TouchSession(qq)
+ }
+ 
+-// HasSession 检查本地是否存在任何已保存的历史登录凭证
++// HasSession 检查本地是否存在任何已保存的历史登录凭证。
++// 存储本身故障时返回 false 仅代表“没有可用凭证”，错误细节请用 LoadSessions 获取。
+ func HasSession() bool {
+-	sessions, _ := LoadSessions()
++	sessions, err := LoadSessions()
++	if err != nil {
++		return false
++	}
+ 	return len(sessions) > 0
+ }
+ 
+-// saveSessionsToFile 将多账号状态全量写入本地文件
++// saveSessionsToFile 将多账号状态全量、原子地写入本地文件：
++// 先写同目录临时文件并落盘，再 rename 替换，任何一步失败都不会破坏旧文件。
+ func saveSessionsToFile(sessions map[string]*Session) error {
+-	// 确保目录存在
+ 	dir := filepath.Dir(SessionPath)
+-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+-		_ = os.MkdirAll(dir, os.ModePerm)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return &SessionStorageError{Op: "创建目录", Path: SessionPath, Err: err}
+ 	}
+ 
+ 	data, err := json.MarshalIndent(sessions, "", "  ")
+ 	if err != nil {
+-		return err
++		return &SessionStorageError{Op: "序列化", Path: SessionPath, Err: err}
++	}
++
++	perm := os.FileMode(0o644)
++	if fi, statErr := os.Stat(SessionPath); statErr == nil {
++		perm = fi.Mode().Perm()
++	}
++
++	tmp, err := os.CreateTemp(dir, ".sessions-*.tmp")
++	if err != nil {
++		return &SessionStorageError{Op: "写入临时文件", Path: SessionPath, Err: err}
++	}
++	tmpName := tmp.Name()
++	// 任何失败分支都清理临时文件，但绝不动旧的 sessions.json。
++	cleanup := func() { _ = os.Remove(tmpName) }
++
++	if _, err := tmp.Write(data); err != nil {
++		_ = tmp.Close()
++		cleanup()
++		return &SessionStorageError{Op: "写入临时文件", Path: SessionPath, Err: err}
++	}
++	if err := tmp.Sync(); err != nil {
++		_ = tmp.Close()
++		cleanup()
++		return &SessionStorageError{Op: "写入临时文件", Path: SessionPath, Err: err}
++	}
++	if err := tmp.Close(); err != nil {
++		cleanup()
++		return &SessionStorageError{Op: "写入临时文件", Path: SessionPath, Err: err}
++	}
++	if err := os.Chmod(tmpName, perm); err != nil {
++		cleanup()
++		return &SessionStorageError{Op: "写入临时文件", Path: SessionPath, Err: err}
+ 	}
+ 
+-	return os.WriteFile(SessionPath, data, 0644)
++	if err := os.Rename(tmpName, SessionPath); err != nil {
++		cleanup()
++		return &SessionStorageError{Op: "替换", Path: SessionPath, Err: err}
++	}
++	return nil
+ }
+ 
+ // qunCookieForQQ 取出该号上次授权过的群管理页 Cookie；没有则空。空间重新扫码时用来接着用。
+diff --git a/internal/qzone/session_test.go b/internal/qzone/session_test.go
+index b6f97a6..66d2dec 100644
+--- a/internal/qzone/session_test.go
++++ b/internal/qzone/session_test.go
+@@ -3,14 +3,26 @@
+ package qzone
+ 
+ import (
++	"context"
++	"errors"
++	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+-func TestQunCookieForQQPreservedAcrossSave(t *testing.T) {
++func useTempSessionStore(t *testing.T) string {
++	t.Helper()
+ 	old := SessionPath
+-	SessionPath = filepath.Join(t.TempDir(), "sessions.json")
++	dir := t.TempDir()
++	SessionPath = filepath.Join(dir, "sessions.json")
+ 	t.Cleanup(func() { SessionPath = old })
++	return SessionPath
++}
++
++func TestQunCookieForQQPreservedAcrossSave(t *testing.T) {
++	useTempSessionStore(t)
+ 
+ 	if got := qunCookieForQQ("514092640"); got != "" {
+ 		t.Fatalf("empty store = %q", got)
+@@ -41,3 +53,285 @@ func TestNewClientFromSessionKeepsQunCookie(t *testing.T) {
+ 		t.Fatalf("client = %+v", c)
+ 	}
+ }
++
++// 损坏的会话文件必须显式报错，任何写入路径都不能把它当成空库覆盖掉。
++func TestCorruptSessionStoreNeverOverwritten(t *testing.T) {
++	path := useTempSessionStore(t)
++	original := []byte("{this-is-not-json")
++	if err := os.WriteFile(path, original, 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := LoadSessions(); !IsSessionStorageError(err) {
++		t.Fatalf("LoadSessions on corrupt file err = %v, want session storage error", err)
++	}
++	if _, err := GetLastSession(); !IsSessionStorageError(err) {
++		t.Fatalf("GetLastSession err = %v", err)
++	}
++	if err := SaveSession(&Session{QQ: "1", Cookie: "x"}); !IsSessionStorageError(err) {
++		t.Fatalf("SaveSession err = %v, want session storage error", err)
++	}
++	if err := TouchSession("1"); !IsSessionStorageError(err) {
++		t.Fatalf("TouchSession err = %v, want session storage error", err)
++	}
++	if err := RemoveSession("1"); !IsSessionStorageError(err) {
++		t.Fatalf("RemoveSession err = %v, want session storage error", err)
++	}
++
++	got, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != string(original) {
++		t.Fatalf("corrupt file was overwritten:\nbefore: %s\nafter:  %s", original, got)
++	}
++}
++
++// null 条目属于损坏文件，而不是空账号库。
++func TestNullEntryTreatedAsCorrupt(t *testing.T) {
++	path := useTempSessionStore(t)
++	if err := os.WriteFile(path, []byte(`{"123456":null}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := LoadSessions(); !IsSessionStorageError(err) {
++		t.Fatalf("err = %v, want session storage error", err)
++	}
++}
++
++// 文件不可读（目标路径是目录）时同样按存储故障处理。
++func TestUnreadableSessionStore(t *testing.T) {
++	old := SessionPath
++	dir := t.TempDir()
++	SessionPath = dir // 目录无法被 ReadFile 当文件读
++	t.Cleanup(func() { SessionPath = old })
++
++	if _, err := LoadSessions(); !IsSessionStorageError(err) {
++		t.Fatalf("err = %v, want session storage error", err)
++	}
++	if err := SaveSession(&Session{QQ: "1"}); !IsSessionStorageError(err) {
++		t.Fatalf("SaveSession err = %v, want session storage error", err)
++	}
++}
++
++// 写入成功后不得残留临时文件；多个账号、群授权必须完整保留。
++func TestSaveMergesAccountsAndCleansTempFiles(t *testing.T) {
++	path := useTempSessionStore(t)
++	dir := filepath.Dir(path)
++
++	if err := SaveSession(&Session{QQ: "111", Nickname: "A", Cookie: "c1", QunCookie: "qun1"}); err != nil {
++		t.Fatal(err)
++	}
++	if err := SaveSession(&Session{QQ: "222", Nickname: "B", Cookie: "c2"}); err != nil {
++		t.Fatal(err)
++	}
++
++	sessions, err := LoadSessions()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(sessions) != 2 || sessions["111"].QunCookie != "qun1" || sessions["222"].Nickname != "B" {
++		t.Fatalf("merged sessions = %+v", sessions)
++	}
++
++	entries, _ := os.ReadDir(dir)
++	for _, e := range entries {
++		if strings.HasPrefix(e.Name(), ".sessions-") {
++			t.Fatalf("temp file left behind: %s", e.Name())
++		}
++	}
++}
++
++// TouchSession 只刷新指定账号的最近使用时间：群授权保留，其他账号内容一字不动。
++func TestTouchSessionOnlyUpdatesLastUsed(t *testing.T) {
++	useTempSessionStore(t)
++
++	// 截断到秒：JSON 往返会丢掉单调时钟和亚秒精度。
++	oldTime := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
++	if err := SaveSession(&Session{QQ: "111", Nickname: "A", Cookie: "c1", QunCookie: "qun1"}); err != nil {
++		t.Fatal(err)
++	}
++	// 直接把两个账号的 LastUsed 改成确定的旧值。
++	sessions, err := LoadSessions()
++	if err != nil {
++		t.Fatal(err)
++	}
++	sessions["111"].LastUsed = oldTime
++	sessions["222"] = &Session{QQ: "222", Nickname: "B", Cookie: "c2", QunCookie: "qun2", LastUsed: oldTime}
++	if err := saveSessionsToFile(sessions); err != nil {
++		t.Fatal(err)
++	}
++
++	time.Sleep(10 * time.Millisecond)
++	if err := TouchSession("111"); err != nil {
++		t.Fatal(err)
++	}
++
++	got, err := LoadSessions()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !got["111"].LastUsed.After(oldTime) {
++		t.Fatalf("selected account LastUsed not refreshed: %v", got["111"].LastUsed)
++	}
++	if got["111"].QunCookie != "qun1" || got["111"].Cookie != "c1" || got["111"].Nickname != "A" {
++		t.Fatalf("selected account content changed: %+v", got["111"])
++	}
++	other := got["222"]
++	if other.LastUsed != oldTime || other.QunCookie != "qun2" || other.Cookie != "c2" || other.Nickname != "B" {
++		t.Fatalf("other account content changed: %+v", other)
++	}
++
++	// 刷新一个已经不存在的账号不算错误（可能已被用户主动清理）。
++	if err := TouchSession("999"); err != nil {
++		t.Fatalf("touch missing account: %v", err)
++	}
++}
++
++// 保存缺少 QQ 的会话必须被拒绝。
++func TestSaveSessionRejectsEmptyQQ(t *testing.T) {
++	useTempSessionStore(t)
++	if err := SaveSession(&Session{Cookie: "x"}); err == nil {
++		t.Fatal("want error for empty QQ")
++	}
++}
++
++// 首次使用：文件不存在时加载为空，保存后可读回（不影响首次扫码登录流程）。
++func TestFirstUseFlowStillWorks(t *testing.T) {
++	useTempSessionStore(t)
++	sessions, err := LoadSessions()
++	if err != nil || len(sessions) != 0 {
++		t.Fatalf("first use = %v, %v", sessions, err)
++	}
++	if HasSession() {
++		t.Fatal("HasSession = true on empty store")
++	}
++	if err := SaveSession(&Session{QQ: "111", Cookie: "c1"}); err != nil {
++		t.Fatal(err)
++	}
++	if !HasSession() {
++		t.Fatal("HasSession = false after save")
++	}
++}
++
++func TestClassifyLoginCheckError(t *testing.T) {
++	biz := func(code int64, msg string) *albumAPIError {
++		return &albumAPIError{page: 1, kind: albumErrBiz, httpCode: 200, hasBiz: true, bizCode: code, bizMsg: msg, body: "shine_Callback({})"}
++	}
++
++	cases := []struct {
++		name      string
++		ctx       context.Context
++		err       error
++		invalid   bool
++		temporary bool
++	}{
++		{name: "nil is valid", ctx: context.Background(), err: nil},
++		{name: "biz -3000 invalid", ctx: context.Background(), err: biz(-3000, "请先登录"), invalid: true},
++		{name: "biz -4001 invalid", ctx: context.Background(), err: biz(-4001, "登录已失效"), invalid: true},
++		{name: "biz -87998 invalid", ctx: context.Background(), err: biz(-87998, ""), invalid: true},
++		{name: "explicit login message invalid", ctx: context.Background(), err: biz(-99999, "请先登录空间"), invalid: true},
++		{
++			name:    "login html page invalid",
++			ctx:     context.Background(),
++			err:     &albumAPIError{kind: albumErrParse, httpCode: 200, body: `<!doctype html><html><script src="https://xui.ptlogin2.qq.com/xlogin"></script></html>`, cause: errors.New("invalid JSONP response")},
++			invalid: true,
++		},
++		{
++			name:      "unknown biz code is temporary",
++			ctx:       context.Background(),
++			err:       biz(-1, "操作过于频繁，请稍后再试"),
++			temporary: true,
++		},
++		{
++			name:      "http 429 temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrStatus, httpCode: 429},
++			temporary: true,
++		},
++		{
++			name:      "http 500 temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrStatus, httpCode: 500},
++			temporary: true,
++		},
++		{
++			name:      "http 503 temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrStatus, httpCode: 503},
++			temporary: true,
++		},
++		{
++			name:      "http 403 temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrStatus, httpCode: 403},
++			temporary: true,
++		},
++		{
++			name:      "network failure temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrNetwork, cause: errors.New("dial tcp: connection refused")},
++			temporary: true,
++		},
++		{
++			name:      "unexpected parse failure temporary",
++			ctx:       context.Background(),
++			err:       &albumAPIError{kind: albumErrParse, httpCode: 200, body: "shine_Callback(;;;)", cause: errors.New("invalid JSONP response")},
++			temporary: true,
++		},
++		{
++			name:      "plain network error temporary",
++			ctx:       context.Background(),
++			err:       errors.New("dial timeout"),
++			temporary: true,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := classifyLoginCheckError(tc.ctx, tc.err)
++			if tc.err == nil {
++				if got != nil {
++					t.Fatalf("want nil, got %v", got)
++				}
++				return
++			}
++			if tc.invalid && !IsCredentialInvalid(got) {
++				t.Fatalf("want credential invalid, got %T: %v", got, got)
++			}
++			if tc.temporary && !IsTemporaryLoginError(got) {
++				t.Fatalf("want temporary, got %T: %v", got, got)
++			}
++		})
++	}
++}
++
++// 已取消的 context 下，任何错误都必须是暂时性的，且错误链可观察到取消原因。
++func TestClassifyContextCanceledPreservesCredential(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	got := classifyLoginCheckError(ctx, errors.New("request stopped"))
++	if !IsTemporaryLoginError(got) {
++		t.Fatalf("got %T: %v", got, got)
++	}
++	if IsCredentialInvalid(got) {
++		t.Fatalf("canceled request must not invalidate credential: %v", got)
++	}
++	if !errors.Is(got, context.Canceled) {
++		t.Fatalf("error chain should contain context.Canceled: %v", got)
++	}
++}
++
++// 普通风控 HTML（没有任何登录站点特征）不能被误判成凭证失效。
++func TestRiskControlHTMLIsTemporary(t *testing.T) {
++	err := &albumAPIError{
++		kind:     albumErrParse,
++		httpCode: 200,
++		body:     "<!doctype html><html><body>服务繁忙，请稍后再试</body></html>",
++		cause:    errors.New("invalid JSONP response"),
++	}
++	got := classifyLoginCheckError(context.Background(), err)
++	if !IsTemporaryLoginError(got) {
++		t.Fatalf("got %T: %v", got, got)
++	}
++}
