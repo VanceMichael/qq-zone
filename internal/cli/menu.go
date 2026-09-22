@@ -117,7 +117,7 @@ func (c *CLI) Menu(ctx context.Context) {
 
 		prompt := &survey.Select{
 			Message:  color.New(color.FgCyan, color.Bold).Sprint(menuMsg),
-			PageSize: 14,
+		PageSize: 15,
 			Options: []string{
 				"🏠 下载自己的相册",
 				"📂 下载群相册",
@@ -127,12 +127,13 @@ func (c *CLI) Menu(ctx context.Context) {
 				"💭 备份好友的说说",
 				"🗒️ 备份好友的留言板",
 				"📖 查看说说备份",
-				"📘 查看留言板备份",
-				"🔁 重试上次失败项",
-				"🔍 查看对我开放的好友",
-				"⚙️ 开启/关闭调试模式",
-				"🔄 切换账号/重新登录",
-				"👋 退出程序",
+			"📘 查看留言板备份",
+			"🧪 完整性核验与修复",
+			"🔁 重试上次失败项",
+			"🔍 查看对我开放的好友",
+			"⚙️ 开启/关闭调试模式",
+			"🔄 切换账号/重新登录",
+			"👋 退出程序",
 			},
 			Description: func(value string, index int) string {
 				switch index {
@@ -153,24 +154,26 @@ func (c *CLI) Menu(ctx context.Context) {
 				case 7:
 					return "打开已经备份过的说说时间线，无需重新登录"
 				case 8:
-					return "打开已经备份过的留言板，无需重新登录"
-				case 9:
-					return "浏览历史失败任务列表，手动选择要重试的任务，仅重试尚未成功的文件"
-				case 10:
-					return "自动扫描并列出所有允许您访问空间的好友及其相册概况"
-				case 11:
-					status := "关闭"
-					if c.logFact.IsDebug() {
-						status = "开启"
-					}
-					return fmt.Sprintf("记录 API 日志，并在备份时标注视频拉取链路 (当前: %s)", status)
-				case 12:
-					return "注销当前登录状态，并准备扫码登录新账号"
-				case 13:
-					return "结束本次备份任务并安全退出"
-				default:
-					return ""
+				return "打开已经备份过的留言板，无需重新登录"
+			case 9:
+				return "无需登录/联网：按账本核验本地照片视频，报告缺失、改动、未登记与未完成，并可定点修复"
+			case 10:
+				return "浏览历史失败任务列表，手动选择要重试的任务，仅重试尚未成功的文件"
+			case 11:
+				return "自动扫描并列出所有允许您访问空间的好友及其相册概况"
+			case 12:
+				status := "关闭"
+				if c.logFact.IsDebug() {
+					status = "开启"
 				}
+				return fmt.Sprintf("记录 API 日志，并在备份时标注视频拉取链路 (当前: %s)", status)
+			case 13:
+				return "注销当前登录状态，并准备扫码登录新账号"
+			case 14:
+				return "结束本次备份任务并安全退出"
+			default:
+				return ""
+			}
 			},
 		}
 
@@ -261,6 +264,9 @@ func (c *CLI) Menu(ctx context.Context) {
 			c.handleViewMood()
 		case strings.Contains(option, "查看留言板备份"):
 			c.handleViewBoard()
+		case strings.Contains(option, "完整性核验与修复"):
+			// 明确不做 ensureLogin：核验全程离线，修复动作内部才按需登录。
+			c.handleIntegrity(ctx)
 		case strings.Contains(option, "重试上次失败项"):
 			if c.client == nil {
 				if err := c.ensureLogin(ctx); err != nil {

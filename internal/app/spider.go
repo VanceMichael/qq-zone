@@ -90,6 +90,11 @@ type Spider struct {
 	debugLines []string        // 回退/失败明细，等当前相册进度条结束后再打印，避免和 mpb 抢终端
 	albumStats videoDebugStats // 当前相册内各视频链路的命中次数
 	taskStats  videoDebugStats // 整次备份任务的链路命中次数，用于最后一行「全部视频」汇总
+
+	ledger     *Ledger       // 当前任务域根的完整性账本（无账本时为内存新账本，首次提交落盘）
+	ledgerRoot string        // 账本域根路径，staged 条目用它算 rel_path
+	ledgerMu   sync.Mutex    // 保护 staged；账本自身的下标只在提交边界串行访问
+	staged     []LedgerEntry // 已完成文件待提交条目，相册边界或重试结束时原子提交
 }
 
 // videoDebugStats 统计调试模式下各视频实际走了哪条拉取链路。
@@ -139,6 +144,11 @@ func (s *Spider) isGroupMode() bool {
 func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (*DownloadResult, error) {
 	s.results = DownloadResult{}
 
+	// 打开（或首次新建）域根完整性账本；账本双损坏时宁可中止也不允许空账本覆盖。
+	if err := s.initLedger(targetUin); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
+	}
+
 	p := mpb.NewWithContext(ctx)
 	waitName := "正在拉取相册列表"
 	if s.isGroupMode() {
@@ -178,7 +188,8 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
 			s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", name)
 			continue
 		}
-		if len(s.whitelist) > 0 && !s.whitelist[name] {
+		// 白名单既支持相册名（普通勾选），也支持相册 ID（完整性修复按计划里的相册 ID 限定范围）。
+		if len(s.whitelist) > 0 && !s.whitelist[name] && !s.whitelist[album.Get("id").String()] {
 			continue
 		}
 		filteredAlbums = append(filteredAlbums, album)
@@ -219,6 +230,11 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems 
 		return &s.results, nil
 	}
 
+	// 重试同样要维护账本：成功补回的文件重新登记，取消时不提交半成品状态。
+	if err := s.initLedger(targetUin); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
+	}
+
 	atomic.StoreUint64(&s.results.Total, uint64(len(failedItems)))
 	s.resetVideoDebugLogs()
 	s.logVideoDebugHint()
@@ -244,6 +260,7 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems 
 			p.Wait()
 			s.flushVideoDebugLogs()
 			s.flushTaskVideoSummary()
+			s.commitStagedLedger(false)
 			return &s.results, nil
 		default:
 		}
@@ -285,6 +302,7 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems 
 	p.Wait()
 	s.flushVideoDebugLogs()
 	s.flushTaskVideoSummary()
+	s.commitStagedLedger(ctx.Err() == nil)
 	return &s.results, nil
 }
 
@@ -464,6 +482,9 @@ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin s
 	// 进度条完成后再打调试日志，避免 Windows 上和 mpb 抢同一块终端。
 	s.flushVideoDebugLogs()
 	s.flushAlbumVideoSummary(albumName)
+	// 账本提交边界：相册完整跑完（任务未取消）才把本相册成果原子写入；
+	// 非增量模式整个相册目录被重建，旧前缀条目由提交逻辑整体替换。
+	s.commitAlbumLedger(albumPath, !exclude, ctx.Err() == nil)
 	return waitErr
 }
 
@@ -503,6 +524,9 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 	if filenameDate == "" {
 		filenameDate = "00000000000000"
 	}
+
+	// 该照片/视频在空间侧的稳定身份，账本登记与「是否可离线跳过」都以它为准。
+	sourceID := s.albumMediaSourceID(targetUin, album, sloc)
 
 	var tasks []mediaTask
 	isVideo := photo.Get("is_video").Bool()
@@ -567,13 +591,22 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 	for _, task := range tasks {
 		isSkip := false
 		var route videoRoute
-		// 增量模式：本地已有同名（无扩展名）文件，且体积看起来完整，则跳过下载。
+		// 增量模式：本地已有同名（无扩展名）文件时，先用账本做纯本地核对。
 		if exclude {
 			base := strings.TrimSuffix(task.filename, filepath.Ext(task.filename))
 			if existingPath, ok := localFiles[base]; ok {
 				task.filename = filepath.Base(existingPath)
-				if s.shouldSkipExisting(ctx, existingPath, task.candidates) {
+				switch s.ledger.SkipDecision(sourceID) {
+				case LedgerSkipHealthy:
+					// 路径 + 字节数 + 摘要与账本一致：直接离线跳过，不发 HEAD。
 					isSkip = true
+				case LedgerSkipMismatch:
+					// 账本登记过但当前文件缺失或内容不一致：必须重下，不能再被 HEAD 大小判定跳过。
+				default:
+					// 账本里没有这个来源：沿用旧的 HEAD Content-Length 判定，但不据此登记账本健康。
+					if s.shouldSkipExisting(ctx, existingPath, task.candidates) {
+						isSkip = true
+					}
 				}
 			}
 		}
@@ -617,6 +650,12 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
 			if chtimesErr := os.Chtimes(actualTarget, t, t); chtimesErr != nil {
 				s.logger.Debugf("failed to set OS time for %s: %v", actualTarget, chtimesErr)
 			}
+		}
+
+		// 只有真正新下载完成的文件才登记（走到这里说明下载成功；失败已 continue）。
+		// 账本跳过与旧 HEAD 跳过都不改变账本；失败项在上面 continue，绝不会被登记。
+		if !isSkip {
+			s.stageCompletedMedia(sourceID, actualTarget)
 		}
 
 		s.updateResults(isSkip, task.isVideo)

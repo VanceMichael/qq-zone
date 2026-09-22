@@ -30,6 +30,8 @@ type BoardBackup struct {
 	spaceName string      // 被备份空间的昵称，查看页标题用
 	spaceUin  string      // 主人 QQ，寄语头像用
 	intro     *BoardIntro // 本轮接口里拿到的主人寄语
+
+	ledger mediaLedgerSession // 留言板媒体完整性账本会话
 }
 
 // NewBoardBackup 创建留言板备份任务。
@@ -48,6 +50,11 @@ func (b *BoardBackup) Backup(ctx context.Context, targetUin string, exclude bool
 	root := boardRoot(targetUin)
 	if err := os.MkdirAll(filepath.Join(root, "data"), os.ModePerm); err != nil {
 		return nil, err
+	}
+
+	// 打开留言板域根完整性账本；双损坏时中止，不允许用空账本覆盖。
+	if err := b.ledger.init(LedgerKindBoard, sourcePrefixBoard, targetUin, root); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
 	}
 
 	// 增量对比用：本地 backup.json 里已有的留言 id → 整条记录（配图路径要靠它回写）。
@@ -180,6 +187,9 @@ func (b *BoardBackup) Backup(ctx context.Context, targetUin string, exclude bool
 		return &b.results, fmt.Errorf("生成查看页失败: %w", err)
 	}
 
+	// 账本只在整次备份正常走完后提交一次；取消则保留旧版。
+	b.ledger.commit(ctx.Err() == nil, b.logger)
+
 	success := uint64(len(posts))
 	if b.results.Failed > uint64(len(posts)) {
 		success = 0
@@ -196,6 +206,9 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
 	file, err := loadBoardBackup(root)
 	if err != nil {
 		return nil, fmt.Errorf("读取已有留言板备份失败: %w", err)
+	}
+	if err := b.ledger.init(LedgerKindBoard, sourcePrefixBoard, targetUin, root); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
 	}
 
 	byTID := map[string]*MoodPost{}
@@ -222,6 +235,7 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
 		case <-ctx.Done():
 			bar.Abort(true)
 			p.Wait()
+			b.ledger.commit(false, b.logger)
 			return &b.results, ctx.Err()
 		default:
 		}
@@ -246,10 +260,19 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
 		dest := filepath.Join(root, filepath.FromSlash(rel))
 		if util.Exists(dest) {
 			if fi, statErr := os.Stat(dest); statErr == nil && fi.Size() > 0 {
-				atomic.AddUint64(&b.results.Success, 1)
-				atomic.AddUint64(&b.results.Skipped, 1)
-				bar.Increment()
-				continue
+				// 账本一致才离线跳过；不一致必须重下；无条目沿用旧「非空即跳过」。
+				decision := LedgerSkipNoEntry
+				if media != nil {
+					decision = b.ledger.decision(item.MoodTID, media)
+				} else {
+					decision = b.ledger.decisionFor(item.MoodTID, item.MediaID, item.MediaURL)
+				}
+				if decision != LedgerSkipMismatch {
+					atomic.AddUint64(&b.results.Success, 1)
+					atomic.AddUint64(&b.results.Skipped, 1)
+					bar.Increment()
+					continue
+				}
 			}
 		}
 
@@ -268,6 +291,20 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
 				}
 			}
 		}
+		// 重试补回的留言配图要登记；media 树缺失时用失败项要素兜底。
+		if media != nil {
+			b.ledger.stage(item.MoodTID, media)
+		} else {
+			fallback := MoodMedia{ID: item.MediaID, URL: item.MediaURL, Path: rel}
+			if res != nil {
+				if path, ok := res["path"].(string); ok {
+					if relPath, relErr := filepath.Rel(root, path); relErr == nil {
+						fallback.Path = filepath.ToSlash(relPath)
+					}
+				}
+			}
+			b.ledger.stage(item.MoodTID, &fallback)
+		}
 		b.noteImageSuccess()
 		atomic.AddUint64(&b.results.Success, 1)
 		bar.Increment()
@@ -283,6 +320,7 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
 	if err := writeBoardViewer(root, file); err != nil {
 		return &b.results, err
 	}
+	b.ledger.commit(ctx.Err() == nil, b.logger)
 	return &b.results, nil
 }
 
@@ -521,8 +559,11 @@ func (b *BoardBackup) downloadOneMedia(ctx context.Context, root, targetUin stri
 
 	if util.Exists(dest) {
 		if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
-			b.noteImageSuccess()
-			return
+			// 账本一致才离线跳过；不一致必须重下；无条目沿用旧「非空即跳过」。
+			if b.ledger.decision(ownerTID, m) != LedgerSkipMismatch {
+				b.noteImageSuccess()
+				return
+			}
 		}
 	}
 
@@ -553,6 +594,8 @@ func (b *BoardBackup) downloadOneMedia(ctx context.Context, root, targetUin stri
 		t := time.Unix(created, 0)
 		_ = os.Chtimes(filepath.Join(root, filepath.FromSlash(m.Path)), t, t)
 	}
+	// 下载成功（失败已在上面 return）才登记进完整性账本。
+	b.ledger.stage(ownerTID, m)
 	b.noteImageSuccess()
 }
 

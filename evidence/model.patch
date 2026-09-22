@@ -1,0 +1,5208 @@
+diff --git a/.trae/specs/media-integrity-ledger/review.md b/.trae/specs/media-integrity-ledger/review.md
+new file mode 100644
+index 0000000..3a017a5
+--- /dev/null
++++ b/.trae/specs/media-integrity-ledger/review.md
+@@ -0,0 +1,100 @@
++# 媒体完整性账本、离线核验与定点修复 - Independent Review
++
++- [x] CP-R1: 四类备份账本登记结构正确且与磁盘一致
++  - **Type**: `rule`
++  - **Covers**: AC-1, AC-4
++  - **Evidence**: R1 fail（F1：多相册 Save 后索引串号，可丢失健康条目）→ 修复后由 R2 复核
++
++- [x] CP-R2: 仅完成态登记（HLS .part/续传 sidecar/失败项不得健康）
++  - **Type**: `rule`
++  - **Covers**: AC-2
++  - **Evidence**: R1 pass：hls.go 5 个失败点均只留 .part；stage 仅在成功路径；TestDownloadHLS* 实测
++
++- [x] CP-R3: 账本原子切换、bak 回退、取消保留上一版
++  - **Type**: `rule`
++  - **Covers**: AC-3
++  - **Evidence**: R1 pass：atomicWriteFile tmp+Sync+rename；损坏回退/双损坏中止有测试；取消 commit(false) 字节不变；-race 通过
++
++- [x] CP-R4: 账本一致性闸门：路径+字节+摘要一致才跳过/声称健康，不一致强制重下
++  - **Type**: `rule`
++  - **Covers**: AC-5
++  - **Evidence**: R1 fail（F1 使多相册场景查错条目）→ I-1 修复后由 R2 复核
++
++- [x] CP-R5: 离线核验四分类稳定且零网络、零修改
++  - **Type**: `rule`
++  - **Covers**: AC-6
++  - **Evidence**: R1 fail（F2：avatars sidecar 误报未完成）→ I-2 修复后由 R2 复核；零网络/零修改本身成立
++
++- [x] CP-R6: 基线显式建立、来源未验证；未登记纳入不自动修复
++  - **Type**: `rule`
++  - **Covers**: AC-7, AC-12
++  - **Evidence**: R1 pass：ErrLedgerExists、二次确认、幂等纳入、未登记不入计划均有测试
++
++- [x] CP-R7: 定点修复只处理确认项（隔离、健康不重写），计划跨运行续作
++  - **Type**: `rule`
++  - **Covers**: AC-8, AC-9
++  - **Evidence**: R1 pass（备注：裁决偏保守，扩展名变更见 advisory A3，I-4 顺手修复）
++
++- [x] CP-R8: 菜单入口免登录；计划落盘先于登录；破坏性动作有确认
++  - **Type**: `rule`
++  - **Covers**: AC-10
++  - **Evidence**: R1 fail（F3：修复无独立确认）→ I-3 修复后由 R2 复核
++
++- [x] CP-R9: 构建/vet/测试全绿，既有能力无回归
++  - **Type**: `rule`
++  - **Covers**: AC-11
++  - **Evidence**: R1 pass：build/vet/test/-race/windows 交叉编译全绿，gofmt 无差异
++
++- [x] CP-U1: 与四类备份链路的集成一致性与复用度
++  - **Type**: `rubric`
++  - **Covers**: AC-13
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 另起下载/身份逻辑、大量复制；3 = 主链路复用但有旁路；5 = 全部复用现有取源/重试/记录体系，四类对称接入
++  - **Pass Threshold**: >= 4
++  - **Evidence**: R1 4/5（四类对称、零平行下载实现、修复并入 TaskRecord；F1 属边界缺陷，I-1 后复评）
++
++- [x] CP-U2: 终端四段报告与修复流程可用性
++  - **Type**: `rubric`
++  - **Covers**: AC-14
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 原始日志堆砌；3 = 分段但缺汇总/风险提示；5 = 四段分明+汇总+风险提示+风格统一
++  - **Pass Threshold**: >= 4
++  - **Evidence**: R1 4/5（四段+表格+风险提示；变更段未展示摘要差异，不阻塞）
++
++- [x] CP-U3: GB 级文件流式处理、内存克制、有进度
++  - **Type**: `rubric`
++  - **Covers**: AC-15
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 整文件入内存/无进度；3 = 流式但无进度或 I/O 放大；5 = 流式+固定缓冲+进度
++  - **Pass Threshold**: >= 4
++  - **Evidence**: R1 4/5；实现方实测 1GiB 643ms/≈1592MiB/s/Alloc≈3.2MiB，256KiB 固定缓冲，CLI 有 mpb 进度
++
++## Review History
++
++### Review R2
++- **Result**: `pass`
++- **Evidence**:
++  - 全新上下文第二轮审查，独立实跑 build/vet/test/-race/GOOS=windows/gofmt 全绿；在 /tmp 副本自设三相册交错场景复核 F1 已修复（Save 排序后 rebuildIndex，全仓库 Entries 原地变更点均维护下标）。
++  - F2 修复确认：marker 识别在 inManagedScope 之后，mood/board 的 avatars/assets 标记零噪声（有/无账本两路径实测），media 内标记与相册域根 marker 不回归。
++  - F3 修复确认：新计划落 repair.json 前独立 Confirm（默认否，拒绝即返回不落盘不登录）；继续既有计划沿用既有询问；plan.Save 严格先于 ensureLogin。
++  - I-4 复核：ledgerSourceResolved 误判路径不可达（quarantine 已移走坏文件、条目只能在下载成功后更新、裁决前重新 LoadLedger）；IsVideo 在 RetryFailed 中确实影响死链重试/getinfo/HLS 兜底分支；HLS ctx 取消测试实跑通过。
++  - 检查点：CP-R1~R9 全部 pass；CP-U1/U2/U3 均 4/5（>=4）。
++  - 不阻塞 advisory：A1 Upsert 同来源改 rel 时旧 byRelPath 键残留（无消费者可观测，建议一行 delete）；A2 HLS 最终 rename 在 Windows 目标已存在时的理论边界（修复流程已先隔离，触发面窄）；A3 修复中取消时隔离区已有移动，建议文案明示（已采纳）；A4 空域根会落 0 条目账本（无害）。
++- **Blocked By**: 无
++- **Resume When**: 无需 R3。
++- **R2 后加固（实现方采纳 advisory，已补测试与全量回归）**：
++  - A1：Upsert 更新分支在 rel 变更时 delete 旧 byRelPath 键；新增 TestLedgerUpsertSourceRenameDropsOldRelIndex。
++  - A3：CLI 修复中断日志明示隔离文件保留位置与续作行为。
++  - 加固后 go build/vet/test -count=1 全绿。A2/A4 记录为后续可选项（不影响验收）。
++
++### Review R1
++- **Result**: `fail`
++- **Evidence**:
++  - 审查者在全新上下文通读全部工件并实跑 build/vet/test/-race/GOOS=windows；F1、F2 均以一次性程序在 /tmp 副本实跑取证（仓库零改动）。
++  - **F1（high, actionable）**：`Ledger.Save()` 原地排序 Entries 后未重建 bySource/byRelPath，多相册增量备份在首个相册提交后，后续 SkipDecision/Upsert 命中错位下标——缺失文件可被判 healthy 离线跳过，Upsert 接管逻辑可误删无关健康条目。位置 ledger.go Save；复现：A/B 两相册→Save→删 B0→A2 提交→B0 SkipDecision 返回 healthy。
++  - **F2（low, actionable）**：scanManagedFiles 的 marker 判定在 inManagedScope 之前，说说/留言板域根 avatars/*.resume.json 被误报未完成并可污染 repair.json。
++  - **F3（low, actionable）**：CLI 选择修复后无独立 Confirm 直接落计划+登录，与 FR-9/TR-8.3 不符。
++  - Advisory（不阻塞）：A1 bak 写失败被静默吞；A2 固定 tmp 名/无父目录 fsync（单进程假设可接受）；A3 修复裁决仅按 rel，扩展名变更会使计划项永久残留；A4 提交失败提示文案与实际补登记条件不符；A5 测试盲区（跨相册 Save、ctx 取消 HLS、范围外 marker）；A6 moodFailedItems 缺 IsVideo，视频 getinfo 兜底可能不触发。
++  - 检查点：CP-R1/R4/R5/R8 fail；CP-R2/R3/R6/R7/R9 pass；rubric 4/4/4。
++- **Blocked By**: 无
++- **Resume When**: I-1~I-3 修复并回归后，启动全新审查 R2（I-4 顺带处理 A3/A4/A6 与 A5 测试盲区）
+diff --git a/.trae/specs/media-integrity-ledger/spec.md b/.trae/specs/media-integrity-ledger/spec.md
+new file mode 100644
+index 0000000..289d1b1
+--- /dev/null
++++ b/.trae/specs/media-integrity-ledger/spec.md
+@@ -0,0 +1,275 @@
++# 媒体完整性账本、离线核验与定点修复 - Product Requirements Document
++
++## Overview
++- **Summary**: 为个人相册、群相册、说说、留言板四类备份建立持久的媒体完整性账本：仅对真正完成并关闭的目标媒体文件登记稳定来源身份、实际相对路径、字节数与 SHA-256 内容摘要；提供不登录、不联网的本地核验入口（缺失 / 内容变更 / 未登记 / 未完成四类稳定结果）；用户显式选择后，仅对确认损坏或缺失的项按原备份类型的既有取源与重试链路定点重建，并支持修复计划跨运行续作；账本始终以原子方式切换，旧备份可显式建立「来源未验证」基线。
++- **Purpose**: 备份盘被移动、文件被手工整理或异常断电后，用户能离线分辨本地照片/视频是否仍然可信，且修复过程不重写健康文件、不要求一次性跑完。
++- **Target Users**: 使用本工具备份 QQ 空间相册/群相册/说说/留言板，并长期归档本地文件的个人用户。
++
++## Goals
++- 四类备份各有一份随备份目录走的持久账本，登记「完成态」媒体。
++- 续传半成品、HLS 中间产物、失败项永远不会被标记为健康。
++- 离线核验：无登录、无网络请求、不修改任何媒体文件和账本，四类结果分开、稳定呈现。
++- 定点修复：只重建被确认损坏/缺失/未完成的项；健康文件不重写；修复中断后下次可继续。
++- 账本写入原子化：取消、崩溃、写盘失败后，磁盘上始终保留一份完整可解析的旧账本。
++- 无账本旧备份可由用户显式建立本地基线，且基线条目标记为「来源未验证」。
++- 现有增量跳过、断点续传、失败项重试、任务记录、查看页全部继续可用；凡依据账本声称健康或跳过的媒体，路径与内容必须与账本一致。
++
++## Non-Goals
++- 不做云端对账：除用户显式发起的修复外，不与 QQ 空间服务器比对原件；核验阶段绝无网络请求。
++- 不登记核心媒体之外的文件：头像（avatars）、查看页资源（assets/、index.html）、data/backup.json、raw 元数据页、album_metadata.json 均不登记，也不作为「未登记」报告。
++- 不自动删除用户文件：修复时损坏文件只隔离不删除；未登记文件不自动清理、不自动重下。
++- 不改造现有查看页的数据格式与交互。
++- 不引入第三方新依赖（哈希使用 Go 标准库）。
++
++## Background & Context
++
++### 现有目录布局
++- 个人相册：`storage/qzone/<目标QQ>/album/<相册名>[/YYYY/MM]/IMG_*|VID_*`
++- 群相册：`storage/qzone/<登录QQ>/qun/<群号>/<相册名>[/YYYY/MM]/...`
++- 说说：`storage/qzone/<目标QQ>/shuoshuo/`（`data/backup.json`、`media/YYYY/MM/`、`avatars/`、`index.html`、`assets/`、`raw/`）
++- 留言板：`storage/qzone/<目标QQ>/liuyanban/`（结构同说说）
++- 任务记录：`storage/tasks/<id>.json`；配置：`storage/config.json`
++
++### 完成态/半成品信号（现状）
++- 普通直链下载（`internal/net/http/http.go` 的 `Download`）：下载前写 `目标文件.resume.json` sidecar，完整落盘并通过大小核对后删除 sidecar；异常中断会留下「目标文件 + sidecar」的半成品。
++- HLS 下载（`internal/net/http/hls.go` 的 `DownloadHLS`）：分片直接写入最终目标文件名，中断会留下同名半截文件且无 sidecar 标记。
++- 只有 `Download`/`DownloadHLS` 返回 nil error 才代表文件真正完成并关闭。
++
++### 稳定来源身份（现状可用字段）
++- 个人相册：照片 JSON 的 `sloc`（本地文件名由 `MD5(sloc)` 派生），配合相册 `id`。
++- 群相册：群号 + 相册 `id` + `sloc`。
++- 说说/留言板：条目 `tid` + 媒体 `MoodMedia.ID`（空间侧 pic_id/视频 id）；`ID` 为空时以 `tid+ID+URL` 的 MD5 兜底（与现有文件名派生一致）。
++
++## Functional Requirements
++
++### FR-1 账本模型与存放位置
++- 每个备份「域根」一份账本，位于域根下隐藏目录 `.integrity/ledger.json`：
++  - 个人相册：`storage/qzone/<QQ>/album/.integrity/ledger.json`
++  - 群相册：`storage/qzone/<登录QQ>/qun/<群号>/.integrity/ledger.json`
++  - 说说：`storage/qzone/<QQ>/shuoshuo/.integrity/ledger.json`
++  - 留言板：`storage/qzone/<QQ>/liuyanban/.integrity/ledger.json`
++- 账本为单一 JSON，至少包含：结构版本、备份类型（album/group_album/shuoshuo/board）、归属 QQ、群号（群相册）、哈希算法名（sha256）、创建/更新时间、条目数组。
++- 每条目至少包含：稳定来源身份 `source_id`、媒体类型（image/video/voice）、相对域根的 POSIX 风格相对路径 `rel_path`、字节数 `size`、SHA-256 摘要、来源是否已验证标志 `origin_verified`、创建/更新时间。
++- 来源身份格式固定：
++  - 个人相册：`album:<目标QQ>:<相册ID>:<sloc>`
++  - 群相册：`group:<登录QQ>:<群号>:<相册ID>:<sloc>`
++  - 说说：`shuoshuo:<目标QQ>:<tid>:<媒体ID>`；媒体 ID 为空时用 `shuoshuo:<目标QQ>:<tid>:url:<MD5(媒体URL)>`
++  - 留言板：同上，前缀为 `board:`
++  - 本地基线（无网络身份）：`local:<rel_path>`，且 `origin_verified=false`
++- 同一来源身份在一本账本中只对应一条条目（按 source_id 去重 upsert）。
++
++### FR-2 仅登记完成态
++- 账本条目只在下载链路成功返回（文件写完、关闭、通过下载层既有完整性核对）后，对最终路径文件计算字节数与 SHA-256 再登记。
++- 续传半成品（存在 `.resume.json`）、HLS 中间产物（`.part`）、失败项禁止写入账本、禁止被标记健康。
++- HLS 下载必须先写临时文件 `<目标>.part`，全部分片写完并正常关闭后才改名为最终目标文件；失败则保留 `.part` 作为未完成标记，不得出现「最终文件名的半截 HLS 文件」。
++- 账本登记时若同一相对路径上已有 `local:` 基线条目，新条目（空间身份、已验证）替换它。
++
++### FR-3 账本原子提交
++- 写账本采用「同目录临时文件写完整 → flush/sync → 原子 rename 覆盖」；崩溃、取消、写盘失败时，`ledger.json` 要么是上一份完整状态、要么是新的完整状态，绝不出现半截 JSON。
++- 另保留 `ledger.bak` 作为最近一次完好版本；加载 `ledger.json` 失败时回退到 `ledger.bak`。两者都损坏时中止账本相关操作并明确报错，不得用空账本覆盖。
++- 一次备份的提交边界：个人/群相册每完整跑完一个相册提交一次（该边界点新状态完整）；说说/留言板在整次备份正常结束时提交一次；修复在修复运行结束时提交一次。
++- 用户取消时：未到提交边界的成果（如跑到一半的相册）不提交，上一份账本保持不变；这些已下载但未登记文件在下次核验中如实显示为「未登记」，不会被声称为健康。
++
++### FR-4 在线备份与重试集成
++- 个人相册、群相册、说说、留言板备份及各自失败重试成功后，按 FR-1/FR-2 登记账本（`origin_verified=true`，因为字节确实来自空间且下载后重新计算了摘要）。
++- 增量模式下的跳过判定：
++  - 账本中存在同一来源身份条目，且条目的 rel_path 指向的现存文件字节数与 SHA-256 均一致 → 允许跳过（相册跳过此路径不需要网络 HEAD）；
++  - 条目存在但路径不存在、大小或摘要不一致 → 不得跳过，走正常下载/换源链路重建；
++  - 账本不存在或该文件无条目 → 沿用现有跳过逻辑（相册 HEAD Content-Length 判定；说说/留言板「非空即跳过」），但不得据此写入或声称账本健康。
++- 非增量（全量）相册备份在某相册完整跑完后，账本中该相册目录前缀下的旧条目以本次成果整体替换。
++- 下载失败、重试失败的项不登记；已有的历史条目不因一次失败的下载尝试而被改写或删除（磁盘文件是否仍可信由离线核验判定）。
++- 账本登记/核对所需的哈希计算必须流式进行，不得把大视频整体读入内存。
++
++### FR-5 离线本地核验
++- 主菜单提供无需登录即可进入的「完整性核验与修复」入口；核验过程不构造登录态、不发起任何网络请求。
++- 自动发现本机四类备份域根，列出类型、归属账号/群、账本有无与条目数，供用户选择单个或全部核验。
++- 对每条账本条目，按下列优先级分类，结果稳定（按 rel_path 排序、可重复运行）：
++  1. 目标文件不存在 → **缺失**；
++  2. 目标路径存在未完成标记（同名 `.resume.json` sidecar 或目标为/存在对应 `.part`）→ **未完成**；
++  3. 字节数不一致 → **内容变更**；
++  4. SHA-256 不一致 → **内容变更**；
++  5. 全部一致 → 健康（单独统计，并区分「来源已验证 / 来源未验证」两个数）。
++- 对磁盘的反向扫描（仅核心媒体范围）：
++  - 个人/群相册域根：递归全部文件，排除 `.integrity/`、`album_metadata.json`、`*.resume.json`、`*.part`；
++  - 说说/留言板域根：仅扫描 `media/` 目录，排除 `*.resume.json`、`*.part`；
++  - 发现的未完成标记文件（.part / .resume.json）计入**未完成**；在管理范围内但账本无对应 rel_path 的媒体文件计入**未登记**。
++- 终端分四段报告：缺失、内容变更、未登记、未完成；每段给出数量与明细（相对路径、条目来源、期望/实际大小或摘要差异），并给出健康统计。
++- 核验只读：不修改、不移动、不删除任何媒体文件，不修改账本，不在备份目录内写报告文件（报告仅输出到终端）。
++
++### FR-6 旧备份显式建立本地基线
++- 对没有账本的域根，用户经明确确认（菜单二次确认，文案说明含义）后可建立本地基线。
++- 基线扫描与 FR-5 相同的核心媒体范围：对每个现存且非未完成的文件计算 size 与 SHA-256，写入 `origin_verified=false`、`source_id=local:<rel_path>` 的条目。
++- 未完成文件（.part/.resume.json 对应目标）不得纳入基线，单列提示。
++- 基线建立过程中及其后的任何文案都不得声称当前字节已与空间原件核对；条目保持「来源未验证」，直到该文件未来确实经由成功的在线下载/修复（字节来自网络并重新摘要一致）才升级为 `origin_verified=true`。
++- 已存在账本的域根不允许「重建基线」覆盖；对核验出的「未登记」文件可另行执行「纳入基线」，同样标记来源未验证。
++
++### FR-7 修复计划与持久化
++- 仅在用户于核验后选择「修复」（或在菜单选择继续既有修复）时，才在该域根写入 `.integrity/repair.json` 计划；计划在请求登录之前落盘。
++- 计划项来自核验确认的缺失、内容变更、可定位来源的未完成项；未登记项不自动进入修复计划（用户可改为纳入基线）。
++- 每个计划项记录：source_id、rel_path、原因（missing/changed/incomplete）、媒体类型，以及按类型的取源提示（相册：相册名/相册 ID；说说/留言板：tid、媒体 ID，必要时从本地 backup.json 补全）。无法确定空间来源的项（如只剩 local 身份的基线项）标记为不可自动修复，修复时跳过并明确报告。
++- 计划的写入与更新同样采用原子替换。无登录凭证、网络失败、用户取消时，未解决的计划项必须保留；下次运行进入同一入口可发现并选择「继续修复」。
++- 计划项修复成功后从计划中移除；失败则保留并记录最后错误原因。
++
++### FR-8 定点修复执行
++- 修复需要登录（群相册沿用现有群授权）；登录失败或用户取消时保留计划，不做任何文件改动。
++- 修复只处理计划内的 rel_path：
++  - 内容变更/未完成：先把现有文件（连同 sidecar/.part 标记）移动到 `.integrity/quarantine/<时间戳>/` 下并保留原相对路径结构，再重建；缺失项直接重建；
++  - 健康文件、计划外文件一律不得删除、改写或重下（实际下载前仍经 FR-4 的账本一致性核对）。
++- 重建必须走各备份类型的现有取源与重试链路：
++  - 个人/群相册：隔离/清除计划文件后，以增量模式、相册白名单限定在受影响相册，复用 Spider 的列表拉取、多候选地址、视频换源、断点续传与重试；
++  - 说说/留言板：从本地 backup.json 定位 tid+媒体，复用现有 `RetryFailed` 的详情刷新、候选地址、getinfo 换源链路，成功后照常重写 backup.json 与查看页。
++- 修复成功的文件按 FR-2 重新登记（摘要一致、`origin_verified=true`）；修复结束时账本原子提交一次。
++- 修复运行写入一条 mode=repair 的任务记录（统计与残留失败项），与既有任务记录体系并存；跨运行续作以 repair.json 为准。
++
++### FR-9 菜单入口
++- 主菜单新增「🧪 完整性核验与修复（本地核验无需登录）」，进入时不触发登录。
++- 流程包含：选择域根 →（无账本时）建立基线或仅列文件 → 核验与四段报告 → 修复 / 纳入未登记项 / 继续未完成计划 / 丢弃计划 / 返回。
++- 所有破坏性或外发动作（建立基线、隔离修复、丢弃计划）都必须有显式确认；核验本身不需要确认。
++
++### FR-10 既有能力兼容
++- 现有增量跳过、断点续传（含 sidecar 与 If-Range）、失败项重试菜单、任务记录、说说/留言板查看页行为保持可用。
++- 查看页不读取也不依赖 `.integrity/`；账本目录对查看页、备份扫描无副作用。
++- 全量（非增量）相册备份清空相册目录的行为不变，但账本域根位于相册目录的上一级，不会被一并清掉。
++
++## Non-Functional Requirements
++- **NFR-1 性能与内存**：哈希全部流式 SHA-256；核验大体积备份时显示进度，内存占用不随文件体积增长；跳过核对的本地哈希开销在可接受范围（本地磁盘顺序读取）。
++- **NFR-2 跨平台**：路径处理兼容 macOS 与 Windows（原子 rename、路径分隔、隐藏目录），不改变现有 Windows 构建方式。
++- **NFR-3 可测试性**：账本读写、分类决策、基线、计划续作、跳过决策等纯逻辑必须可在无网络、无登录条件下单测；`go build ./...`、`go vet ./...`、既有测试全部通过。
++- **NFR-4 无新增依赖**：使用 Go 1.25 标准库与现有依赖完成。
++- **NFR-5 可观测性**：核验/修复过程的关键结论与错误同时输出到终端和现有任务日志。
++
++## Constraints
++- **Technical**：Go 1.25；fx 依赖注入；下载层在 `internal/net/http`，备份编排位于 `internal/app`，交互位于 `internal/cli`；媒体下载链路需登录态与 Cookie，不得为核验引入任何网络调用。
++- **Business**：用户数据安全优先：只读核验、隔离不删除、健康文件不重写、所有写动作可解释。
++- **Dependencies**：修复链路依赖现有 qzone 客户端能力（登录、相册/照片列表、视频多源、说说/留言详情）；无凭证时只能停在计划阶段。
++
++## Assumptions
++- 进程工作目录即现有 `storage/` 所在目录（与现状一致），账本路径均相对该目录。
++- 同一域根同一时刻只有一个备份/修复进程操作（沿用现状，不引入文件锁）。
++- 异常断电后 POSIX 同目录 rename 的原子性成立；Windows 桌面版同样支持替换式 rename（实现上保证 temp 与目标同卷）。
++- 现有 `*.resume.json` 命名与「成功后删除 sidecar」的行为保持不变，作为未完成检测信号之一。
++
++## Acceptance Criteria
++
++### AC-1: 四类备份各有结构正确的持久账本
++- **Type**: `rule`
++- **Given**: 任一类型的备份成功下载至少一个媒体文件
++- **When**: 备份到达提交边界
++- **Then**: 对应域根出现 `.integrity/ledger.json`，条目含 source_id（符合 FR-1 身份格式）、rel_path、size、sha256、origin_verified=true、时间戳；JSON 可被重新解析
++- **Pass Condition**: 四类备份各构造一例，字段与身份格式断言通过
++- **Evidence**: 新增单元测试断言 + 实际生成的 ledger.json 样例
++
++### AC-2: 半成品、HLS 中间产物、失败项不会被标记健康
++- **Type**: `rule`
++- **Given**: 制造 `.resume.json` 半成品、`.part` 文件、下载失败项三类场景
++- **When**: 备份提交账本 / 执行核验
++- **Then**: 三类对象均不出现为账本健康条目；HLS 成功路径只在 rename 后产生最终文件，失败时只留 `.part`
++- **Pass Condition**: 单元测试覆盖三种场景，且 hls.go 经临时文件+最终 rename 实现
++- **Evidence**: 账本断言、临时目录文件树断言、hls 下载实现代码与测试
++
++### AC-3: 账本原子切换，中断后始终存在可解析的上一份状态
++- **Type**: `rule`
++- **Given**: 已存在一份完好账本
++- **When**: 新状态写入过程中模拟失败（磁盘写入错误/进程取消）
++- **Then**: ledger.json 仍为上一份完整可解析内容；ledger.json 损坏时可从 ledger.bak 恢复；两份皆损时明确报错且不覆盖
++- **Pass Condition**: 故障注入测试三种情形
++- **Evidence**: atomic write/load 单元测试
++
++### AC-4: 在线备份后登记且条目与磁盘一致
++- **Type**: `rule`
++- **Given**: 个人相册/群相册/说说/留言板各完成一次含新下载与跳过的备份
++- **When**: 提交后用账本逐条 stat + 重新哈希
++- **Then**: 每个成功完成的媒体在账本中恰有一条，size/sha256/rel_path 与磁盘一致；失败项无条目
++- **Pass Condition**: 以临时目录构造下载成功/跳过/失败混合场景，账本与磁盘对账无差异
++- **Evidence**: 编排层登记逻辑单元测试
++
++### AC-5: 依据账本的健康声明与跳过必须路径、内容一致
++- **Type**: `rule`
++- **Given**: 同一文件分别处于「一致」「字节被改」「被移动/缺失」「仅有无条目旧文件」四种状态
++- **When**: 执行增量跳过决策
++- **Then**: 仅第一种跳过且无需网络；第二、三种必须进入下载链路；第四种沿用旧逻辑且不写账本健康声明
++- **Pass Condition**: 跳过决策函数四种分支测试通过
++- **Evidence**: 决策函数单元测试（含「不发起 HEAD」断言或代码路径证明）
++
++### AC-6: 离线核验输出四类稳定结果且零网络、零修改
++- **Type**: `rule`
++- **Given**: 构造含健康、缺失、变更、未登记、.part、.resume.json 的固定夹具目录
++- **When**: 在无 qzone.Client、无网络条件下运行核验两次
++- **Then**: 两次输出分类与排序完全一致，四类计数与预置一致，健康项区分已验证/未验证；运行前后目录内全部文件（含账本）字节一致
++- **Pass Condition**: 夹具测试通过，并断言无网络请求（核验代码不引用 http.Client/登录态）且文件树前后哈希不变
++- **Evidence**: verifier 单元测试
++
++### AC-7: 旧备份基线为显式操作且标记来源未验证
++- **Type**: `rule`
++- **Given**: 一个没有 ledger.json 的域根
++- **When**: 未经确认时不建立；用户显式确认后建立基线
++- **Then**: 条目 origin_verified=false、source_id 为 local:<rel_path>；.part/.resume 对应文件被排除并提示；报告文案不含「已与原件核对」语义；已有账本时拒绝重建基线
++- **Pass Condition**: 基线逻辑与文案断言测试通过
++- **Evidence**: baseline 单元测试
++
++### AC-8: 修复只重建确认项：隔离原链路、健康不重写
++- **Type**: `rule`
++- **Given**: 核验产生含缺失、变更、未完成、健康文件、未登记文件的计划
++- **When**: 执行修复（下载链路以可注入方式模拟成功/失败）
++- **Then**: 仅计划内路径被处理；变更/未完成原文件进入 quarantine 并保留相对结构；健康文件未被写动（mtime/内容不变）；成功项重新登记 origin_verified=true 并移出计划；失败项保留原因
++- **Pass Condition**: 修复编排的隔离范围、跳过决策、计划移除/保留均有测试
++- **Evidence**: repair 单元测试（隔离目录、文件 mtime、计划与账本状态断言）
++
++### AC-9: 修复中断可跨运行续作
++- **Type**: `rule`
++- **Given**: 计划已落盘后分别遇到无登录凭证、网络失败、用户取消
++- **When**: 重新进入核验/修复入口
++- **Then**: repair.json 原样保留且原子可读；菜单能发现并继续；已成功的计划项不重复处理，未完成项继续
++- **Pass Condition**: 计划持久化/加载/继续逻辑测试通过
++- **Evidence**: repair plan 单元测试 + 菜单流程代码走查
++
++### AC-10: 菜单入口无需登录
++- **Type**: `rule`
++- **Given**: 程序启动后未登录
++- **When**: 选择「完整性核验与修复」并对本机已有备份执行核验
++- **Then**: 全程不弹出登录/扫码，不发起网络请求即可看到四段报告
++- **Pass Condition**: 入口代码无 ensureLogin 调用，核验路径无网络依赖
++- **Evidence**: 代码走查 + 手工运行记录
++
++### AC-11: 既有能力回归不破坏
++- **Type**: `rule`
++- **Given**: 现有全部单元测试与构建
++- **When**: 实现完成后运行 `go build ./...`、`go vet ./...`、`go test ./...`
++- **Then**: 全部通过；增量跳过、断点续传、失败重试菜单、任务记录、说说/留言板查看页功能手工抽验正常
++- **Pass Condition**: 命令输出全绿，关键旧路径手工抽验记录无异常
++- **Evidence**: CI 等价命令输出 + 手工抽验记录
++
++### AC-12: 未登记媒体可纳入基线且不自动修复
++- **Type**: `rule`
++- **Given**: 核验发现未登记文件
++- **When**: 用户选择「纳入基线」与直接选择「修复」
++- **Then**: 纳入后条目 origin_verified=false 且文件不变；修复流程不触碰未登记文件
++- **Pass Condition**: 两条分支测试通过
++- **Evidence**: verifier/repair 单元测试
++
++### AC-13: 集成一致性与代码质量
++- **Type**: `rubric`
++- **Dimension**: 新机制与四类备份链路、配置、任务记录、目录约定的集成一致性；抽象边界清晰、复用现有下载与重试链路、无重复实现
++- **Scale**: 1-5
++- **Anchors**: 1 = 另起一套下载/身份逻辑、大量复制粘贴、行为与现有链路漂移；3 = 主要链路复用但有一两处旁路实现或约定不一致；5 = 完全复用现有取源/重试/记录体系，四类备份对称接入，命名与目录约定统一
++- **Pass Threshold**: >= 4
++- **Evidence**: 代码走查与独立审查
++
++### AC-14: 终端报告可用性
++- **Type**: `rubric`
++- **Dimension**: 核验四段报告与修复进度的可读性：分类清晰、路径可定位、数量汇总准确、风险（来源未验证/不可自动修复项）有明确提示
++- **Scale**: 1-5
++- **Anchors**: 1 = 仅堆砌原始 JSON/日志；3 = 分段可用但缺汇总或风险提示；5 = 四段分明、有汇总、有风险提示、与现有 CLI 表格风格一致
++- **Pass Threshold**: >= 4
++- **Evidence**: 实际终端输出截图/文本记录与走查
++
++### AC-15: 大文件性能与内存克制
++- **Type**: `rubric`
++- **Dimension**: 哈希与登记对 GB 级视频的处理：流式 I/O、有进度、常驻内存不随文件大小增长
++- **Scale**: 1-5
++- **Anchors**: 1 = 整文件读入内存或无进度疑似卡死；3 = 流式但无进度/存在双倍 I/O 放大；5 = 流式哈希、带进度、单文件固定小缓冲
++- **Pass Threshold**: >= 4
++- **Evidence**: 实现走查（io.Copy/固定缓冲）与大文件手工核验计时记录
++
++## Open Questions
++- 无（三个关键取舍已经用户确认：登记范围=仅核心媒体；修复=隔离后重下；报告=仅终端，修复计划在进入修复时才落盘）。
+diff --git a/.trae/specs/media-integrity-ledger/tasks.md b/.trae/specs/media-integrity-ledger/tasks.md
+new file mode 100644
+index 0000000..52d1193
+--- /dev/null
++++ b/.trae/specs/media-integrity-ledger/tasks.md
+@@ -0,0 +1,255 @@
++# 媒体完整性账本、离线核验与定点修复 - Implementation Plan
++
++## Task 1: 账本核心模型、原子存储与哈希工具
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增 internal/app/ledger.go（Ledger/Entry/域根/身份构造/upsert/前缀替换/原子写/bak 回退/域根发现）与 internal/pkg/util FileDigest+FileSHA256（256KiB 固定缓冲流式）。
++  - TR-1.1~1.5 全部由 ledger_test.go 覆盖并通过（go test 绿）：身份格式、媒体类型推断、upsert 去重与 local 替换、前缀删除、原子写无 tmp 残留、损坏回退 bak、双损坏 ErrLedgerCorrupt、四类域根发现、EntryFromFile 摘要一致。
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 新增 `internal/app/ledger.go`：`Ledger`/`LedgerEntry` 结构（version、kind、owner_uin、group_id、hash_alg=sha256、时间戳、entries），四类备份域根路径推导（album / qun/<gid> / shuoshuo / liuyanban），域根发现（glob），source_id 构造器（album/group/shuoshuo/board/local），按 source_id upsert、按相册目录前缀替换条目（全量相册用）、按 rel_path 查找。
++  - 原子持久化：同目录 `.tmp` 写完整 → Sync → rename 替换 `ledger.json`；成功替换后刷新 `ledger.bak`；加载时 ledger.json 损坏回退 bak，两者皆损返回显式错误（禁止静默重置）。
++  - 流式 SHA-256（固定缓冲，`io.Copy`），可放 `internal/pkg/util`（如 `FileSHA256`）；媒体类型按扩展名推断（image/video/voice）。
++  - 新增 `internal/app/ledger_test.go`：往返序列化、upsert 去重、前缀替换、损坏回退、原子写后无残留 tmp、身份格式、域根发现。
++- **Acceptance Criteria Addressed**: AC-1, AC-3, AC-15
++- **Test Requirements**:
++  - `rule` TR-1.1: 四类域根路径与发现结果正确（含 qun 层级），证据：glob 夹具测试。
++  - `rule` TR-1.2: source_id 五类构造格式与 FR-1 完全一致，证据：表驱动断言。
++  - `rule` TR-1.3: ledger.json 损坏自动回退 ledger.bak；两者损坏返回错误且不写空账本，证据：故障注入测试。
++  - `rule` TR-1.4: 原子写成功后目录下无临时文件，重复保存内容可往返，证据：目录列表与重新加载断言。
++  - `rule` TR-1.5: SHA-256 流式计算与内存哈希结果一致，且读取使用固定小缓冲（代码审查），证据：测试 + 走查。
++- **Notes**: 账本时间统一 `time.Now`；JSON 字段 snake_case，与现有 backup.json/task record 风格一致。
++
++## Task 2: HLS 完成信号加固（.part 临时文件 + 原子改名）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - hls.go 分片改写 <target>.part，Sync+Close 后 os.Rename 原子改名；四个失败返回点均关闭文件并保留 .part。
++  - 新增 hls_integrity_test.go（httptest 服务）：TR-2.1 成功拼接 INIT+SEG*、无 .part 残留、返回值指向最终路径；TR-2.2 seg 500 时最终文件不存在且 .part 保留；go test ./internal/net/http 全绿。
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 修改 `internal/net/http/hls.go`：分片写入 `<target>.part` 而非最终文件名；全部分片成功、文件正常关闭后 rename 为最终 target（目标已存在时先处理 Windows 兼容替换）；任一分片失败或 ctx 取消时保留 `.part`、不产生最终文件。
++  - 新增 `internal/net/http/hls_integrity_test.go`：用 `httptest` 提供 m3u8 + 分片，成功路径断言最终文件内容正确且无 `.part` 残留；中途失败（某分片 500/中断）断言不存在最终文件、存在 `.part`。
++- **Acceptance Criteria Addressed**: AC-2
++- **Test Requirements**:
++  - `rule` TR-2.1: 成功 HLS 下载后 target 存在、内容为 init+segments 顺序拼接、`.part` 与 sidecar 不存在，证据：httptest 测试。
++  - `rule` TR-2.2: 分片失败/取消时最终 target 不存在、`<target>.part` 保留，证据：httptest 失败用例。
++  - `rule` TR-2.3: 返回值 map 的 path/filename/dir 指向最终 target，证据：测试断言。
++- **Notes**: 普通直链的 `.resume.json` 语义已存在，本任务不改 `http.go` 续传逻辑。
++
++## Task 3: 个人相册与群相册备份链路集成账本
++- **Status**: `completed`
++- **Completion Evidence**:
++  - ledger.go 增加四类链路共用的 SkipDecision（healthy/noEntry/mismatch，纯本地 stat+sha256）。
++  - spider.go：Download/RetryFailed 起始 initLedger（双损坏即中止，不用空账本覆盖）；downloadItem 改为账本一致离线跳过、不一致强制重下、无条目回退旧 HEAD 且不登记；新下载成功 stage 完成条目；每个相册干净边界 commitAlbumLedger（非量整体前缀替换），取消丢弃本相册 staged；RetryFailed 结束 commitStaged；群相册 group: 身份与 qun 域根。
++  - spider_integrity_test.go 覆盖 TR-3.1~3.5：四分支跳过、staging 身份/rel（timeline+扩展名）、全量替换保留他相册、取消账本字节不变、群身份/域根、清空相册不毁域根账本、域外路径拒绝；go test ./... 全绿。
++- **Priority**: high
++- **Depends On**: Task 1, Task 2
++- **Description**:
++  - `internal/app/spider.go`：Spider 增加账本句柄与并发安全的 staged 条目集合；`Download` 开始时按模式打开/新建域根账本（加载失败显式报错）。
++  - `downloadItem`：
++    - 新下载成功后用最终 actualTarget（含 Content-Type 改扩展名、timeline 子目录、Chtimes 后内容不变）计算 size/sha256，stage 条目（source_id 用 album/group 格式，origin_verified=true；同 rel_path 若有 local 条目则替换）；
++    - 增量跳过改为可单测的决策：先查账本条目（source_id 匹配且现存 rel_path 文件 size+sha256 一致）→ 本地跳过（不发 HEAD）；条目不一致 → 不跳过进入下载；无条目 → 保留现有 HEAD 逻辑且不登记；
++    - 失败项不 stage。
++  - 提交边界：每个相册 `downloadAlbum` 完整结束后合并 staged 并原子保存；非增量（exclude=false）成功的相册先移除该相册名前缀的旧条目；`RetryFailed` 结束时提交一次；ctx 取消时丢弃当前未提交相册的 staged。
++  - 群相册 source_id 含登录 QQ 与群号；rel_path 相对 qun/<gid> 域根。
++  - 新增 `spider_integrity_test.go`：跳过决策四分支（一致/改动/缺失/无条目）、staging 身份与路径、全量前缀替换、取消不提交。下载部分以可调用决策函数 + 临时目录真实文件方式测试，不依赖网络。
++- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-4, AC-5, AC-15
++- **Test Requirements**:
++  - `rule` TR-3.1: 一致文件账本跳过路径不访问网络（决策函数无 client 调用），证据：分支测试。
++  - `rule` TR-3.2: 改动/缺失文件不跳过；无条目文件走旧 HEAD 分支且不产生账本变更，证据：分支测试。
++  - `rule` TR-3.3: 新下载成功条目身份格式、rel_path（含年月子目录与扩展名变更）、size/sha256 与磁盘一致；失败项无条目，证据：临时目录测试。
++  - `rule` TR-3.4: 全量相册提交后旧前缀条目被替换、其余相册条目保留；取消时账本保持提交前版本，证据：测试。
++  - `rule` TR-3.5: 群相册条目位于 qun 域根且 source_id 含群号，证据：测试。
++- **Notes**: `buildLocalFileIndex` 非增量删的是相册子目录，账本在域根 `.integrity/`，天然不受影响，补一条测试确认。
++
++## Task 4: 说说与留言板备份链路集成账本
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增 media_ledger_glue.go：说说/留言板共用 mediaLedgerSession（init/sourceID 含 url 兜底/decision/stage/commit）。
++  - mood_backup.go/board_backup.go：Backup/RetryFailed 起始 init（双损坏中止）；downloadOneMedia 与 RetryFailed 现存文件短路改为账本一致离线跳过、mismatch 强制重下、无条目保留旧行为且不登记；成功（含重试兜底构造身份）stage，Backup/Retry 正常结束单次 commit，取消 commit(false) 保留旧账本。
++  - media_ledger_glue_test.go：TR-4.1 身份/语音类型/rel、TR-4.2 三分支（含 mood/board 各一，nil client 证明跳过路径零网络）、TR-4.3 取消账本字节不变+域外拒绝、TR-4.4 头像/assets 无 stage 入口（走查 downloadAvatars 未接触 ledger）；go test ./... 全绿。
++- **Priority**: high
++- **Depends On**: Task 1, Task 2
++- **Description**:
++  - `mood_backup.go` / `board_backup.go`：Backup 开始打开域根账本；`downloadOneMedia` 成功（含视频/语音）后按最终路径 stage 条目（shuoshuo/board 身份，媒体 ID 为空走 url+MD5 兜底，origin_verified=true；替换同 rel_path 的 local 条目）。
++  - 既有「文件非空即跳过」改为决策函数：账本条目一致 → 跳过；条目存在但 size/sha256 不一致 → 不跳过，落回下载重建；无条目 → 保留旧跳过行为且不登记。`RetryFailed` 里现存文件短路（mood_backup.go 约 244 行）同样套用该决策。
++  - 提交时机：Backup 正常走完（backup.json 与查看页写好）后原子提交一次；RetryFailed 结束提交一次；ctx 取消不提交。
++  - 头像、assets、raw、data 不登记。
++  - 新增 mood/board 账本集成测试（临时 backup.json + 媒体夹具，覆盖 stage/跳过/不一致重建/取消不提交）。
++- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-4, AC-5
++- **Test Requirements**:
++  - `rule` TR-4.1: 媒体成功后条目身份（tid+media id / url 兜底）、rel_path（media/YYYY/MM）、size/sha256 正确；评论/转发内媒体与语音同样登记，证据：测试。
++  - `rule` TR-4.2: 账本一致跳过、不一致触发下载路径、无条目旧行为且不登记，三分支测试通过（说说与留言板各一）。
++  - `rule` TR-4.3: 取消（ctx 取消）不提交账本，上一版可解析，证据：测试。
++  - `rule` TR-4.4: avatars/assets/raw/data 下文件不进入账本，证据：条目扫描断言。
++- **Notes**: 留言板只有图片链路；决策函数尽量在两文件间复用（放到共享文件，如 `media_ledger_glue.go`）。
++
++## Task 5: 离线核验器（四分类、稳定、只读）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增 integrity_verify.go：scanManagedFiles（相册递归排除 .integrity/元数据；说说/留言板仅 media/；识别 .resume.json/.part 标记），按 FR-5 优先级分类缺失→未完成→大小→摘要→健康（区分已/未验证），剩余媒体为未登记；结果稳定排序；全程仅 os.Stat/Open/Read，import 无任何网络包；另有 ScanRootWithoutLedger 供无账本仅扫描。
++  - TR-5.1/5.2/5.3/5.4/5.5 由 integrity_verify_test.go 覆盖通过：全类别夹具计数正确、size/hash 两子类型、sidecar 与孤立 part 映射、辅助文件零噪声、两次报告 reflect.DeepEqual、核验前后整树 sha256 快照一致、无账本 ErrLedgerMissing。
++- **Priority**: high
++- **Depends On**: Task 1
++- **Description**:
++  - 新增 `internal/app/integrity_verify.go`：输入域根，按 FR-5 规则产出核验报告（缺失/内容变更/未登记/未完成四类 + 健康统计含已验证/未验证计数）。
++  - 完成态标记识别：`*.resume.json` sidecar（映射到去后缀目标）、`*.part`；管理范围：相册域根递归（排除 `.integrity/`、album_metadata.json、标记文件）；说说/留言板仅 `media/`（排除标记文件）。
++  - 分类优先级与 FR-5 一致；结果按 rel_path 排序；哈希流式、带进度回调（mpb 可选注入，测试传 nil）。
++  - 严格只读：函数只接受文件系统读操作；不创建/修改/删除任何文件；无 http.Client、无 qzone.Client 依赖。
++  - 新增 `integrity_verify_test.go`：夹具目录覆盖全部类别（含 sidecar、.part、未登记、基线未验证条目、timeline 子目录），两次运行结果完全一致；运行前后夹具目录整树哈希不变。
++- **Acceptance Criteria Addressed**: AC-6, AC-15
++- **Test Requirements**:
++  - `rule` TR-5.1: 四类计数与明细与夹具预置完全一致，健康项区分 origin_verified true/false，证据：夹具测试。
++  - `rule` TR-5.2: 同一夹具两次核验结果（含顺序）逐字段相等，证据：比较两次报告。
++  - `rule` TR-5.3: 核验前后目录所有文件（含账本）字节一致，证据：核验前后整树 sha256 快照断言。
++  - `rule` TR-5.4: 核验代码不依赖 net/http 客户端与登录态（包依赖走查），证据：import 走查。
++  - `rule` TR-5.5: sidecar 映射（f→去 .resume.json）与 .part 归类正确，证据：夹具断言。
++
++## Task 6: 旧备份本地基线与「未登记纳入基线」
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增 integrity_baseline.go：EstablishBaseline（已有账本 ErrLedgerExists；仅登记现存非未完成媒体，local 身份 + origin_verified=false，未完成清单单列，原子保存）、AdoptUnregistered（只追加未登记项，幂等，不动媒体）、BaselineNotice 统一文案。
++  - integrity_baseline_test.go 覆盖 TR-6.1~6.4：全部未验证/local、half 目标+sidecar+part 排除、元数据排除、拒绝重建、纳入后媒体树不变（仅账本文件变）、幂等再纳入 0、基线后核验健康未验证且无缺失/变更；测试全绿。
++- **Priority**: high
++- **Depends On**: Task 5
++- **Description**:
++  - 新增 `internal/app/integrity_baseline.go`：对无账本域根，经显式调用（带确认由 CLI 负责）扫描管理范围内现存、非未完成媒体，计算 size/sha256，写入 origin_verified=false、source_id=local:<rel_path> 的账本并原子保存；未完成文件列入返回提示，不登记。
++  - 已有账本时拒绝「重建基线」；提供 `AdoptUnregistered`：把核验报告中的未登记项追加为 local 未验证条目（去重、不改文件）。
++  - 文案常量集中管理，明确「来源未验证、未与空间原件核对」。
++  - 新增测试：无账本建基线、未完成排除、已有账本拒绝、纳入未登记、基线条目不被后续核验误报为变更/缺失。
++- **Acceptance Criteria Addressed**: AC-7, AC-12
++- **Test Requirements**:
++  - `rule` TR-6.1: 基线条目全部 origin_verified=false、source_id=local:<rel_path>、size/sha256 与文件一致，证据：测试。
++  - `rule` TR-6.2: .part/.resume 目标被排除并在提示中列出，证据：测试。
++  - `rule` TR-6.3: 已有账本时建基线返回明确错误；AdoptUnregistered 只追加未登记项且不动磁盘文件，证据：测试 + 文件树快照。
++  - `rule` TR-6.4: 基线后立即核验，基线条目为健康（未验证）而非缺失/变更，证据：联动测试。
++
++## Task 7: 修复计划持久化与定点修复编排
++- **Status**: `completed`
++- **Completion Evidence**:
++  - integrity_repair.go：repair.json 模型/原子读写/空计划自删/HasPendingRepair；NewRepairPlan 只收 missing/changed/incomplete，按 source_id+backup.json 补相册名/相册ID/tid/media/url 取源提示，不可定位项 auto_repairable=false；ExecuteRepair 先把计划内目标+sidecar/.part 移到 .integrity/quarantine/<时间戳>/<原结构>，再经注入的 RepairRunner 走原链路（相册白名单 Spider、说说/留言板 RetryFailed），以 rel 路径账本健康裁决移除/保留计划项，断网/无凭证链路异常时计划不写回、原样保留。
++  - integrity_repair_runner.go：生产 OnlineRepairRunner 完全复用 Spider/MoodBackup/BoardBackup；task_record 增加 TaskModeRepair；Spider 白名单支持相册 ID。
++  - 顺带修正 Upsert 语义：同 rel_path 上已验证条目接管任意旧身份（修复/身份迁移场景），由修复测试暴露并回归。
++  - integrity_repair_test.go（假 runner）：TR-7.1 隔离目录结构含 sidecar；TR-7.2 健康/未登记 mtime 不变；TR-7.3 成功移除计划+登记、失败保留 last_error、断网计划不动、二轮续作清空；TR-7.4 mood FailedItem 复用 RetryFailed；TR-7.5 孤立 part 不可修复并保留；计划往返/自删；go build/vet/test 全绿。
++- **Priority**: high
++- **Depends On**: Task 3, Task 4, Task 5, Task 6
++- **Description**:
++  - 新增 `internal/app/integrity_repair.go`：
++    - `.integrity/repair.json` 模型与原子读写；由核验报告生成计划（missing/changed/incomplete；unregistered 不入计划）；相册类提示取相册名（rel_path 首段）/相册 ID（source_id）；说说/留言板从本地 backup.json 补 tid/media id/URL；local 身份且无法定位空间来源的项标记不可自动修复。
++    - 隔离：changed/incomplete 目标（连同 sidecar/.part）移动到 `.integrity/quarantine/<YYYYMMDD-HHMMSS>/<原rel结构>`；missing 直接重建；计划外文件零接触。
++    - 修复执行：个人/群相册以白名单 Spider（增量、账本跳过）跑受影响相册，登录与群授权沿用现有路径；说说/留言板构造 FailedItem 复用 `MoodBackup.RetryFailed`/`BoardBackup.RetryFailed`；成功后账本已有 stage/提交，计划中移除成功项并原子保存，失败项保留 last_error；不可修复项跳过并报告。
++    - 结束写 mode=repair 的 TaskRecord（复用 DownloadResult 计数）。
++  - 计划续作 API：Load/Save/Continue/丢弃；无凭证/网络失败/取消时计划原样保留。
++  - 新增测试：计划生成与去重、原子读写、隔离目录结构、计划外文件不动（mtime 断言）、成功项移除/失败项保留、local 不可修复项跳过、续作加载；Spider/RetryFailed 调用以接口或函数变量注入假实现，避免真实网络。
++- **Acceptance Criteria Addressed**: AC-8, AC-9, AC-13
++- **Test Requirements**:
++  - `rule` TR-7.1: changed/incomplete 文件被移动到 quarantine 且保留原相对结构；missing 项无隔离动作，证据：夹具测试。
++  - `rule` TR-7.2: 健康与未登记文件在修复前后 mtime+内容不变，证据：修复前后快照断言（注入假下载器）。
++  - `rule` TR-7.3: 成功项从 repair.json 移除且账本条目 origin_verified=true；失败/取消后计划完整保留、可再次加载继续，证据：测试。
++  - `rule` TR-7.4: 修复仅调用既有 Spider / RetryFailed 链路（注入点与真实构造一致），未另起下载实现，证据：代码走查 + 注入断言。
++  - `rule` TR-7.5: local 身份不可修复项被跳过并出现在报告，证据：测试。
++  - `rubric` TR-7.6: 复用集成度；scale 1-5；anchors 1=另起下载/重试实现，3=部分复用，5=四类全部走既有链路与记录体系；threshold >= 4；证据：独立审查走查。
++- **Notes**: 计划必须在请求登录之前落盘，保证无凭证场景下次可继续。
++
++## Task 8: CLI「完整性核验与修复」菜单（免登录入口）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增 internal/cli/integrity.go：域根发现列表（类型/账号/账本状态/条目数/损坏标记）、无账本时显式建基线（含 BaselineNotice 二次确认）或仅扫描、mpb 哈希进度、四段 tablewriter 报告（缺失/变更/未完成/未完成 + 健康已验证/未验证汇总）、修复/纳入未登记/丢弃计划/继续既有计划动作。
++  - menu.go 主菜单新增「🧪 完整性核验与修复」（索引/描述同步重排），dispatch 明确不 ensureLogin；runRepair 先 plan.Save 再登录，无凭证即提示计划保留；修复写 TaskModeRepair 记录并汇总 resolved/remaining/unrepairable。
++  - TR-8.1/8.2/8.3 走查通过：核验路径只调用 app 离线 API；计划落盘先于登录；基线/修复/丢弃均有 Confirm。go build/vet 全绿。
++- **Priority**: high
++- **Depends On**: Task 5, Task 6, Task 7
++- **Description**:
++  - 新增 `internal/cli/integrity.go` 并在 `menu.go` 主菜单加入「🧪 完整性核验与修复（本地核验无需登录）」，入口及整个核验过程不调用 ensureLogin、不发网络请求。
++  - 流程：发现域根 → 列表选择（类型/账号或群/账本状态/条目数，单个或全部）→ 无账本时提供「建立本地基线（二次确认）」或「仅扫描」→ 核验（哈希进度条）→ 终端四段报告（tablewriter 风格 + 汇总：健康已验证/未验证、风险项数）→ 动作：修复（先落计划再登录）/继续既有计划/纳入未登记/丢弃计划（确认）/返回。
++  - 修复前确认文案说明：仅重建确认项、损坏文件隔离、需要登录；登录失败/取消回主菜单且计划保留。
++  - 修复结束复用 `renderTaskSummary` 或同风格汇总。
++- **Acceptance Criteria Addressed**: AC-9, AC-10, AC-14
++- **Test Requirements**:
++  - `rule` TR-8.1: 入口到报告的代码路径无 ensureLogin/网络客户端调用，证据：代码走查（交互函数难单测，以走查+手工运行为准）。
++  - `rule` TR-8.2: 计划落盘先于登录；登录失败后 repair.json 仍存在，证据：走查 + 手工运行记录。
++  - `rule` TR-8.3: 破坏性动作（基线/修复/丢弃计划）均有 survey 确认；核验本身无确认，证据：走查。
++  - `rubric` TR-8.4: 报告可用性；scale 1-5；anchors 1=原始日志堆砌，3=分段但缺汇总/风险提示，5=四段分明+汇总+风险提示+风格统一；threshold >= 4；证据：手工终端输出。
++- **Notes**: 与现有菜单的 emoji/颜色/表格风格保持一致。
++
++---
++
++# Review Issues（R1 fail 后进入修复）
++
++## Issue I-1: Ledger.Save 排序后索引失效，多相册跳过闸门串号（high）
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: None
++- **Discovered By**: Review R1 (F1)
++- **Description**:
++  - Save 原地 sort Entries 后未 rebuildIndex，首个相册边界提交后，同进程后续 SkipDecision/FindBySource/Upsert 通过旧下标访问到别的条目；缺失文件可被判 healthy 离线跳过，Upsert 接管可误删无关健康条目。mood/board/RetryFailed 单次提交不受影响；磁盘 JSON 始终正确。
++- **Acceptance Criteria Addressed**: AC-1, AC-4, AC-5
++- **Test Requirements**:
++  - `rule` TR-I-1.1: Save 后 FindBySource/FindByRelPath 全部仍命中自身条目（跨相册、乱序插入），证据：新单测。
++  - `rule` TR-I-1.2: A 相册提交后删除 B 相册文件，B source 的 SkipDecision 必须为 mismatch；再 Upsert A 新条目不得删除 B 条目，证据：回归测试。
++- **Notes**: 修复方向=排序后 rebuildIndex（或对副本 marshal）。
++
++## Issue I-2: mood/board 把 media/ 之外的未完成标记误报为未完成（low）
++- **Status**: `completed`
++- **Priority**: medium
++- **Depends On**: None
++- **Discovered By**: Review R1 (F2)
++- **Description**:
++  - scanManagedFiles 的 marker 判定先于 inManagedScope，avatars/10001.jpg.resume.json 被计入未完成并可能进 repair.json。mood/board 的 marker 仅当目标位于 media/ 前缀才登记。
++- **Acceptance Criteria Addressed**: AC-6
++- **Test Requirements**:
++  - `rule` TR-I-2.1: shuoshuo/board 域根 avatars 下 sidecar/.part 不出现在任何核验分类（既非未完成也非未登记），证据：夹具测试。
++  - `rule` TR-I-2.2: media/ 内 marker 仍正确计入，证据：既有用例不回归。
++
++## Issue I-3: 修复动作缺少独立二次确认（low）
++- **Status**: `completed`
++- **Priority**: medium
++- **Depends On**: None
++- **Discovered By**: Review R1 (F3)
++- **Description**:
++  - 选择「修复以上问题」后直接 plan.Save→登录，无独立 Confirm，与 FR-9 矛盾。「继续既有计划」已有一次询问，作为确认不重复弹。
++- **Acceptance Criteria Addressed**: AC-10
++- **Test Requirements**:
++  - `rule` TR-I-3.1: 新修复计划落盘前有一次 askYesNo（文案含隔离/登录/健康不重写），拒绝则不落盘不登录；续作路径沿用既有询问，证据：走查。
++
++## Issue I-4: 审查 advisory 顺手修复（A3/A4/A6 + A5 测试盲区）
++- **Status**: `completed`
++- **Priority**: low
++- **Depends On**: I-1
++- **Discovered By**: Review R1 (advisory)
++- **Description**:
++  - A3：修复裁决接受「source_id 条目在新 rel 路径上健康」（Content-Type 改扩展名场景），避免计划项永久残留。
++  - A4：账本提交失败的 Warn 文案改为与实际补登记条件一致（文件重新在线下载时才补登记；否则可用纳入基线）。
++  - A6：moodFailedItems 按 MediaKind 带上 IsVideo，保证视频 getinfo 换源链路触发。
++  - A5：补 HLS ctx 取消路径测试。
++- **Acceptance Criteria Addressed**: AC-8, AC-2
++- **Test Requirements**:
++  - `rule` TR-I-4.1: source 条目在新 rel 健康时计划项可裁决 resolved；IsVideo 透传断言；HLS 取消只留 .part，证据：单测。
++
++### Issues 修复验证证据（R1→R2 之间）
++- **I-1**：ledger.Save 排序后立即 rebuildIndex；新增 TestLedgerSaveKeepsIndexesValidAcrossAlbums（乱序四条目 Save 后 FindBySource/RelPath 全对位；删 B0 后 A2 再提交，B0 仍 mismatch 且 B 条目不被误删）。
++- **I-2**：scanManagedFiles 先 inManagedScope 再识别 marker；新增 TestVerifyMoodIgnoresMarkersOutsideMediaScope（avatars/assets 下 sidecar/.part 在有账本核验与无账本扫描中均零噪声，media 内标记不回归）。
++- **I-3**：runRepair 增加 alreadyConfirmed 参数，新计划落盘前独立 askYesNo（含隔离/登录/健康不重写文案，默认否）；「继续既有计划」沿用既有询问不重复弹。
++- **I-4**：ExecuteRepair 增加 ledgerSourceResolved 裁决（同来源在改名后路径健康即 resolved）；moodFailedItems 透传 IsVideo；账本提交失败 Warn 文案与实际补登记条件一致；新增 TestDownloadHLSContextCancelKeepsOnlyPart（分片阻塞+ctx 取消，最终文件不存在、.part 保留已写字节）与 TestRepairResolvedBySourceAfterExtensionRename（a.jpg→a.png 同来源裁决 resolved 且断言 IsVideo=true）。
++- 复跑：go build/vet/test 全绿，go test -race ./internal/app ./internal/net/http 通过，gofmt 无差异。
++
++## Task 9: 全量构建、静态检查、测试与手工冒烟
++- **Status**: `completed`
++- **Completion Evidence**:
++  - TR-9.1：`go build ./...`、`go vet ./...`、`go test ./... -count=1` 全部退出 0；gofmt 无差异；GOOS=windows/darwin 交叉编译均通过。
++  - TR-9.2（临时冒烟测试，已删除）：在临时 cwd 构造真实 storage 布局（album/qun/shuoshuo/liuyanban 四域根 + .part/.resume.json），DiscoverLedgerRoots 发现 4 个；逐域根 EstablishBaseline→VerifyRoot→NewRepairPlan：基线条目全部健康（未验证）、未完成标记被排除且不入媒体、相册 part 可修复、无 backup.json 的孤立 board sidecar 正确标为不可自动修复、未登记 0。
++  - TR-9.3：1 GiB（sparse）FileDigest 643ms、≈1592 MiB/s、runtime Alloc≈3.2 MiB，固定 256KiB 缓冲流式读取，内存不随文件增长；CLI 核验带 mpb 文件级进度条。
++  - 查看页回归走查：viewer 只读 data/backup.json 与 media/，`.integrity/` 位于各域根隐藏目录，viewer 无任何引用；说说/留言板 backup.json 结构未改。
++- **Priority**: high
++- **Depends On**: Task 1-8
++- **Description**:
++  - 运行 `go build ./...`、`go vet ./...`、`go test ./...` 全绿；补跑既有 board/mood/spider 相关测试确认无回归。
++  - 手工冒烟（本机无网络依赖部分）：构造小型夹具存储目录，走通 免登录核验 → 四段报告 → 建基线/纳入 → 修复计划落盘（登录失败保留）→ 再次进入可见续作；确认说说/留言板查看页正常打开且 `.integrity/` 不影响页面。
++  - 大文件（≥1GB 夹具文件）核验计时与内存粗测，确认流式与进度。
++- **Acceptance Criteria Addressed**: AC-11, AC-15
++- **Test Requirements**:
++  - `rule` TR-9.1: build/vet/test 全部退出码 0，证据：命令输出记录。
++  - `rule` TR-9.2: 冒烟流程各步骤结果符合预期、查看页可打开，证据：手工记录。
++  - `rubric` TR-9.3: 大文件处理；scale 1-5；anchors 1=整文件载入/无进度，3=流式但无进度或明显 I/O 放大，5=流式+进度+固定缓冲；threshold >= 4；证据：计时/内存观察。
+diff --git a/internal/app/board_backup.go b/internal/app/board_backup.go
+index 80474ed..0b5a44a 100644
+--- a/internal/app/board_backup.go
++++ b/internal/app/board_backup.go
+@@ -30,6 +30,8 @@ type BoardBackup struct {
+ 	spaceName string      // 被备份空间的昵称，查看页标题用
+ 	spaceUin  string      // 主人 QQ，寄语头像用
+ 	intro     *BoardIntro // 本轮接口里拿到的主人寄语
++
++	ledger mediaLedgerSession // 留言板媒体完整性账本会话
+ }
+ 
+ // NewBoardBackup 创建留言板备份任务。
+@@ -50,6 +52,11 @@ func (b *BoardBackup) Backup(ctx context.Context, targetUin string, exclude bool
+ 		return nil, err
+ 	}
+ 
++	// 打开留言板域根完整性账本；双损坏时中止，不允许用空账本覆盖。
++	if err := b.ledger.init(LedgerKindBoard, sourcePrefixBoard, targetUin, root); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
++
+ 	// 增量对比用：本地 backup.json 里已有的留言 id → 整条记录（配图路径要靠它回写）。
+ 	existing, _ := loadBoardBackup(root)
+ 	known := map[string]MoodPost{}
+@@ -180,6 +187,9 @@ func (b *BoardBackup) Backup(ctx context.Context, targetUin string, exclude bool
+ 		return &b.results, fmt.Errorf("生成查看页失败: %w", err)
+ 	}
+ 
++	// 账本只在整次备份正常走完后提交一次；取消则保留旧版。
++	b.ledger.commit(ctx.Err() == nil, b.logger)
++
+ 	success := uint64(len(posts))
+ 	if b.results.Failed > uint64(len(posts)) {
+ 		success = 0
+@@ -197,6 +207,9 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
+ 	if err != nil {
+ 		return nil, fmt.Errorf("读取已有留言板备份失败: %w", err)
+ 	}
++	if err := b.ledger.init(LedgerKindBoard, sourcePrefixBoard, targetUin, root); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
+ 
+ 	byTID := map[string]*MoodPost{}
+ 	for i := range file.Posts {
+@@ -222,6 +235,7 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
+ 		case <-ctx.Done():
+ 			bar.Abort(true)
+ 			p.Wait()
++			b.ledger.commit(false, b.logger)
+ 			return &b.results, ctx.Err()
+ 		default:
+ 		}
+@@ -246,10 +260,19 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
+ 		dest := filepath.Join(root, filepath.FromSlash(rel))
+ 		if util.Exists(dest) {
+ 			if fi, statErr := os.Stat(dest); statErr == nil && fi.Size() > 0 {
+-				atomic.AddUint64(&b.results.Success, 1)
+-				atomic.AddUint64(&b.results.Skipped, 1)
+-				bar.Increment()
+-				continue
++				// 账本一致才离线跳过；不一致必须重下；无条目沿用旧「非空即跳过」。
++				decision := LedgerSkipNoEntry
++				if media != nil {
++					decision = b.ledger.decision(item.MoodTID, media)
++				} else {
++					decision = b.ledger.decisionFor(item.MoodTID, item.MediaID, item.MediaURL)
++				}
++				if decision != LedgerSkipMismatch {
++					atomic.AddUint64(&b.results.Success, 1)
++					atomic.AddUint64(&b.results.Skipped, 1)
++					bar.Increment()
++					continue
++				}
+ 			}
+ 		}
+ 
+@@ -268,6 +291,20 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
+ 				}
+ 			}
+ 		}
++		// 重试补回的留言配图要登记；media 树缺失时用失败项要素兜底。
++		if media != nil {
++			b.ledger.stage(item.MoodTID, media)
++		} else {
++			fallback := MoodMedia{ID: item.MediaID, URL: item.MediaURL, Path: rel}
++			if res != nil {
++				if path, ok := res["path"].(string); ok {
++					if relPath, relErr := filepath.Rel(root, path); relErr == nil {
++						fallback.Path = filepath.ToSlash(relPath)
++					}
++				}
++			}
++			b.ledger.stage(item.MoodTID, &fallback)
++		}
+ 		b.noteImageSuccess()
+ 		atomic.AddUint64(&b.results.Success, 1)
+ 		bar.Increment()
+@@ -283,6 +320,7 @@ func (b *BoardBackup) RetryFailed(ctx context.Context, targetUin string, items [
+ 	if err := writeBoardViewer(root, file); err != nil {
+ 		return &b.results, err
+ 	}
++	b.ledger.commit(ctx.Err() == nil, b.logger)
+ 	return &b.results, nil
+ }
+ 
+@@ -521,8 +559,11 @@ func (b *BoardBackup) downloadOneMedia(ctx context.Context, root, targetUin stri
+ 
+ 	if util.Exists(dest) {
+ 		if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
+-			b.noteImageSuccess()
+-			return
++			// 账本一致才离线跳过；不一致必须重下；无条目沿用旧「非空即跳过」。
++			if b.ledger.decision(ownerTID, m) != LedgerSkipMismatch {
++				b.noteImageSuccess()
++				return
++			}
+ 		}
+ 	}
+ 
+@@ -553,6 +594,8 @@ func (b *BoardBackup) downloadOneMedia(ctx context.Context, root, targetUin stri
+ 		t := time.Unix(created, 0)
+ 		_ = os.Chtimes(filepath.Join(root, filepath.FromSlash(m.Path)), t, t)
+ 	}
++	// 下载成功（失败已在上面 return）才登记进完整性账本。
++	b.ledger.stage(ownerTID, m)
+ 	b.noteImageSuccess()
+ }
+ 
+diff --git a/internal/app/integrity_baseline.go b/internal/app/integrity_baseline.go
+new file mode 100644
+index 0000000..115726f
+--- /dev/null
++++ b/internal/app/integrity_baseline.go
+@@ -0,0 +1,123 @@
++// 旧备份本地基线：在无账本域根显式建立「来源未验证」登记；以及把核验出的未登记媒体纳入基线。
++// 基线只描述当前磁盘字节，绝不声称已与空间原件核对。
++
++package app
++
++import (
++	"errors"
++	"sort"
++)
++
++// ErrLedgerExists 表示域根已有账本，不能再「建立基线」覆盖；未登记项请走纳入基线。
++var ErrLedgerExists = errors.New("ledger already exists; use 未登记纳入基线 instead")
++
++// BaselineNotice 是所有涉及基线的界面必须向用户明示的语义。
++const BaselineNotice = "基线仅记录当前磁盘上的字节（路径/大小/SHA-256），来源未验证，" +
++	"并不代表这些文件已与 QQ 空间原件核对；只有以后真正在线重新下载/修复成功的文件才会标记为来源已验证。"
++
++// BaselineResult 汇总一次建基线的成果。
++type BaselineResult struct {
++	Root           string   `json:"root"`
++	Kind           LedgerKind `json:"kind"`
++	EntryCount     int      `json:"entry_count"`      // 纳入基线的媒体数
++	IncompleteList []string `json:"incomplete_list"`  // 被排除的未完成目标/标记（rel_path）
++}
++
++// EstablishBaseline 为没有账本的域根建立本地基线。
++// ownerUin/groupID 仅用于账本元信息（群相册传 groupID，其余传空）。
++// 未完成文件（.part/.resume.json 对应目标）一律排除并在结果中列出。
++func EstablishBaseline(kind LedgerKind, ownerUin, groupID, root string, progress VerifyProgress) (*Ledger, *BaselineResult, error) {
++	if _, err := LoadLedger(root); err == nil {
++		return nil, nil, ErrLedgerExists
++	} else if !errors.Is(err, ErrLedgerMissing) {
++		return nil, nil, err
++	}
++
++	mediaFiles, markers := scanManagedFiles(kind, root)
++	incompleteTargets := map[string]bool{}
++	incompleteMarkers := map[string]bool{}
++	for _, mk := range markers {
++		incompleteMarkers[mk.markerRel] = true
++		// 目标存在（普通续传半成品会留下最终文件名）才排除目标；目标缺失时只排除标记本身。
++		if _, ok := mediaFiles[mk.targetRel]; ok {
++			incompleteTargets[mk.targetRel] = true
++		}
++	}
++
++	l := NewLedger(kind, ownerUin, groupID, root)
++	rels := make([]string, 0, len(mediaFiles))
++	for rel := range mediaFiles {
++		rels = append(rels, rel)
++	}
++	sort.Strings(rels)
++
++	res := &BaselineResult{Root: root, Kind: kind}
++	total := len(rels)
++	for i, rel := range rels {
++		if progress != nil {
++			progress(i+1, total, rel)
++		}
++		if incompleteTargets[rel] {
++			res.IncompleteList = append(res.IncompleteList, rel)
++			continue
++		}
++		e, err := EntryFromFile(root, rel, LocalSourceID(rel), false)
++		if err != nil {
++			// 读不出的文件不登记，交给核验/修复暴露，保持保守。
++			res.IncompleteList = append(res.IncompleteList, rel)
++			continue
++		}
++		l.Upsert(e)
++	}
++	markerRels := make([]string, 0, len(incompleteMarkers))
++	for rel := range incompleteMarkers {
++		markerRels = append(markerRels, rel)
++	}
++	sort.Strings(markerRels)
++	res.IncompleteList = append(res.IncompleteList, markerRels...)
++	sort.Strings(res.IncompleteList)
++
++	if err := l.Save(); err != nil {
++		return nil, nil, err
++	}
++	res.EntryCount = l.Count()
++	return l, res, nil
++}
++
++// AdoptUnregistered 把核验报告中的未登记媒体（或指定 rel 子集）纳入既有账本。
++// 新条目一律 local: 身份、origin_verified=false；本函数不改任何媒体文件。
++// 返回新纳入条目数；文件在核验后被删除/改动导致无法摘要的项会被跳过。
++func AdoptUnregistered(root string, report *VerifyReport, selected []string) (int, error) {
++	if report == nil {
++		return 0, nil
++	}
++	l, err := LoadLedger(root)
++	if err != nil {
++		return 0, err
++	}
++
++	want := map[string]bool{}
++	for _, rel := range selected {
++		want[rel] = true
++	}
++	added := 0
++	for _, item := range report.Section(VerifyUnregistered) {
++		if len(want) > 0 && !want[item.RelPath] {
++			continue
++		}
++		// 已有条目（可能刚好是另一个身份指向同路径）则不重复纳入。
++		if _, exists := l.FindByRelPath(item.RelPath); exists {
++			continue
++		}
++		e, err := EntryFromFile(root, item.RelPath, LocalSourceID(item.RelPath), false)
++		if err != nil {
++			continue
++		}
++		l.Upsert(e)
++		added++
++	}
++	if added == 0 {
++		return 0, nil
++	}
++	return added, l.Save()
++}
+diff --git a/internal/app/integrity_baseline_test.go b/internal/app/integrity_baseline_test.go
+new file mode 100644
+index 0000000..cf0eff2
+--- /dev/null
++++ b/internal/app/integrity_baseline_test.go
+@@ -0,0 +1,130 @@
++// 本地基线与「纳入未登记」测试：来源未验证、未完成排除、已有账本拒绝、纳入不改文件。
++
++package app
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestEstablishBaselineMarksUnverified(t *testing.T) {
++	root := t.TempDir()
++	writeMedia(t, root, "A/ok.jpg", "ok")
++	writeMedia(t, root, "A/2021/03/v.mp4", "video")
++	// 续传半成品：目标 + sidecar，都不能进基线。
++	writeMedia(t, root, "A/half.mp4", "half")
++	writeMedia(t, root, "A/half.mp4.resume.json", "{}")
++	// 孤立 HLS .part。
++	writeMedia(t, root, "A/ghost.mp4.part", "seg")
++	// 非媒体元数据不纳入。
++	writeMedia(t, root, "A/album_metadata.json", "{}")
++
++	l, res, err := EstablishBaseline(LedgerKindAlbum, "10001", "", root, nil)
++	if err != nil {
++		t.Fatalf("establish: %v", err)
++	}
++	if res.EntryCount != 2 {
++		t.Fatalf("基线条目数 = %d, want 2", res.EntryCount)
++	}
++	for _, e := range l.Entries {
++		if e.OriginVerified || !IsLocalSource(e.SourceID) {
++			t.Fatalf("基线条目必须来源未验证且 local 身份: %+v", e)
++		}
++	}
++	if e, ok := l.FindByRelPath("A/2021/03/v.mp4"); !ok || e.MediaKind != MediaKindVideo {
++		t.Fatalf("视频基线条目错误: %+v", e)
++	}
++	if len(res.IncompleteList) != 3 {
++		t.Fatalf("未完成排除清单 = %v，want half 目标+sidecar+part", res.IncompleteList)
++	}
++
++	// 已有账本拒绝重建。
++	if _, _, err := EstablishBaseline(LedgerKindAlbum, "10001", "", root, nil); !errors.Is(err, ErrLedgerExists) {
++		t.Fatalf("重复建基线应 ErrLedgerExists，实际 %v", err)
++	}
++
++	// 基线后立即核验：两条健康（未验证），无缺失/变更。
++	r, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if r.HealthyUnverified != 2 || r.HealthyVerified != 0 {
++		t.Fatalf("基线后核验健康统计错误: %+v", r)
++	}
++	if len(r.Section(VerifyMissing)) != 0 || len(r.Section(VerifyChanged)) != 0 {
++		t.Fatalf("基线条目不应报缺失/变更: %+v", r.Items)
++	}
++}
++
++func TestAdoptUnregisteredAddsOnlyThem(t *testing.T) {
++	root := t.TempDir()
++	// 先建账本并登记 a。
++	l0, _, err := EstablishBaseline(LedgerKindShuoshuo, "10001", "", root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = l0
++
++	// 新出现两个未登记文件 + 一个未完成 part。
++	writeMedia(t, root, "media/2022/01/new1.jpg", "n1")
++	writeMedia(t, root, "media/2022/02/new2.jpg", "n2")
++	writeMedia(t, root, "media/2022/02/bad.mp4.part", "p")
++
++	// 基线时 media/ 为空，账本为空；新文件出现后应全部报未登记。
++	before := treeDigest(t, root)
++	r, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	added, err := AdoptUnregistered(root, r, nil)
++	if err != nil {
++		t.Fatalf("adopt: %v", err)
++	}
++	if added != 2 {
++		t.Fatalf("纳入数 = %d, want 2（part 不算）", added)
++	}
++	after := treeDigest(t, root)
++	// 允许 .integrity/ledger.json 变化（账本本就要更新）；其余文件必须逐字节不变。
++	delete(before, ".integrity/ledger.json")
++	delete(before, ".integrity/ledger.bak")
++	delete(after, ".integrity/ledger.json")
++	delete(after, ".integrity/ledger.bak")
++	if !mapDigestEqual(before, after) {
++		t.Fatal("纳入基线不得改动任何媒体文件")
++	}
++
++	l, err := LoadLedger(root)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, rel := range []string{"media/2022/01/new1.jpg", "media/2022/02/new2.jpg"} {
++		e, ok := l.FindByRelPath(rel)
++		if !ok || e.OriginVerified || !IsLocalSource(e.SourceID) {
++			t.Fatalf("纳入条目必须 local/未验证: %+v", e)
++		}
++	}
++	// 幂等：再次核验后未登记为 0，再纳入 0 条。
++	r2, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(r2.Section(VerifyUnregistered)) != 0 {
++		t.Fatalf("纳入后不应再有未登记: %+v", r2.Section(VerifyUnregistered))
++	}
++	added2, _ := AdoptUnregistered(root, r2, nil)
++	if added2 != 0 {
++		t.Fatalf("重复纳入应为 0，实际 %d", added2)
++	}
++}
++
++func mapDigestEqual(a, b map[string]string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, v := range a {
++		if b[k] != v {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/internal/app/integrity_repair.go b/internal/app/integrity_repair.go
+new file mode 100644
+index 0000000..a5c6eb6
+--- /dev/null
++++ b/internal/app/integrity_repair.go
+@@ -0,0 +1,560 @@
++// 定点修复：由离线核验结果生成持久修复计划，隔离确认损坏/未完成文件，
++// 再按原备份类型的既有取源与重试链路（Spider / MoodBackup / BoardBackup）重建。
++// 健康文件不重写；计划原子持久化，无凭证、断网或取消后下次可继续。
++
++package app
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++	"go.uber.org/zap"
++)
++
++const (
++	repairFileName = "repair.json"
++	repairVersion  = 1
++
++	// RepairReason* 与核验分类对应（未登记不入计划）。
++	RepairReasonMissing    = "missing"
++	RepairReasonChanged    = "changed"
++	RepairReasonIncomplete = "incomplete"
++)
++
++// RepairItem 是一个等待定点重建的媒体。
++type RepairItem struct {
++	SourceID       string    `json:"source_id"`                 // 稳定来源身份；孤立半成品可能为 local:<rel>
++	RelPath        string    `json:"rel_path"`                  // 最终目标媒体相对域根路径
++	MarkerRelPath  string    `json:"marker_rel_path,omitempty"` // 已知的未完成标记（.part/.resume.json），可空
++	Reason         string    `json:"reason"`                    // missing / changed / incomplete
++	MediaKind      string    `json:"media_kind,omitempty"`
++	AutoRepairable bool      `json:"auto_repairable"` // 能否用现有在线链路自动修复
++	AlbumName      string    `json:"album_name,omitempty"`
++	AlbumID        string    `json:"album_id,omitempty"`
++	TID            string    `json:"tid,omitempty"`
++	MediaID        string    `json:"media_id,omitempty"`
++	MediaURL       string    `json:"media_url,omitempty"`
++	LastError      string    `json:"last_error,omitempty"`
++	CreatedAt      time.Time `json:"created_at"`
++	UpdatedAt      time.Time `json:"updated_at,omitempty"`
++}
++
++// RepairPlan 是跨运行续作的修复计划，落盘在域根 .integrity/repair.json。
++type RepairPlan struct {
++	Version   int          `json:"version"`
++	Kind      LedgerKind   `json:"kind"`
++	OwnerUin  string       `json:"owner_uin"`
++	GroupID   string       `json:"group_id,omitempty"`
++	CreatedAt time.Time    `json:"created_at"`
++	UpdatedAt time.Time    `json:"updated_at"`
++	Items     []RepairItem `json:"items"`
++
++	root string `json:"-"`
++}
++
++// RepairPlanPath 返回计划文件路径。
++func RepairPlanPath(root string) string {
++	return filepath.Join(root, integrityDirName, repairFileName)
++}
++
++// ErrRepairPlanMissing 表示域根下没有修复计划。
++var ErrRepairPlanMissing = errors.New("repair plan not found")
++
++// LoadRepairPlan 读取修复计划；文件不存在返回 ErrRepairPlanMissing。
++func LoadRepairPlan(root string) (*RepairPlan, error) {
++	data, err := os.ReadFile(RepairPlanPath(root))
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil, ErrRepairPlanMissing
++		}
++		return nil, err
++	}
++	var p RepairPlan
++	if err := json.Unmarshal(data, &p); err != nil {
++		return nil, err
++	}
++	p.root = root
++	return &p, nil
++}
++
++// HasPendingRepair 判断域根是否存在非空修复计划。
++func HasPendingRepair(root string) bool {
++	p, err := LoadRepairPlan(root)
++	return err == nil && len(p.Items) > 0
++}
++
++// Save 原子写出计划；条目为空时删除计划文件（全部修复完成）。
++func (p *RepairPlan) Save() error {
++	if len(p.Items) == 0 {
++		if err := os.Remove(RepairPlanPath(p.root)); err != nil && !os.IsNotExist(err) {
++			return err
++		}
++		return nil
++	}
++	p.Version = repairVersion
++	p.UpdatedAt = time.Now()
++	sort.SliceStable(p.Items, func(i, j int) bool {
++		if p.Items[i].Reason != p.Items[j].Reason {
++			return p.Items[i].Reason < p.Items[j].Reason
++		}
++		return p.Items[i].RelPath < p.Items[j].RelPath
++	})
++	if err := os.MkdirAll(filepath.Join(p.root, integrityDirName), os.ModePerm); err != nil {
++		return err
++	}
++	data, err := json.MarshalIndent(p, "", "  ")
++	if err != nil {
++		return err
++	}
++	return atomicWriteFile(RepairPlanPath(p.root), data)
++}
++
++// Remove 丢弃整份计划（需用户显式确认后由 CLI 调用）。
++func (p *RepairPlan) Remove() error {
++	if err := os.Remove(RepairPlanPath(p.root)); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return nil
++}
++
++// NewRepairPlan 从核验报告生成计划：缺失/变更/未完成入计划，未登记不入。
++func NewRepairPlan(domain LedgerDomain, report *VerifyReport) *RepairPlan {
++	now := time.Now()
++	p := &RepairPlan{
++		Version:   repairVersion,
++		Kind:      domain.Kind,
++		OwnerUin:  domain.OwnerUin,
++		GroupID:   domain.GroupID,
++		CreatedAt: now,
++		root:      domain.Root,
++	}
++
++	seen := map[string]bool{}
++	add := func(vi VerifyItem) {
++		it := repairItemFromVerify(domain, vi)
++		if seen[it.RelPath] {
++			return
++		}
++		seen[it.RelPath] = true
++		it.CreatedAt = now
++		p.Items = append(p.Items, it)
++	}
++	for _, s := range []string{VerifyMissing, VerifyChanged, VerifyIncomplete} {
++		for _, vi := range report.Section(s) {
++			add(vi)
++		}
++	}
++	return p
++}
++
++// repairItemFromVerify 把单条核验明细转成计划项并补齐取源提示。
++func repairItemFromVerify(domain LedgerDomain, vi VerifyItem) RepairItem {
++	target, marker := splitMarker(vi)
++	it := RepairItem{
++		SourceID:      vi.SourceID,
++		RelPath:       target,
++		MarkerRelPath: marker,
++		Reason:        verifyReasonToRepair(vi.Status),
++		MediaKind:     vi.MediaKind,
++	}
++	if it.RelPath == "" {
++		it.RelPath = vi.RelPath
++	}
++
++	switch domain.Kind {
++	case LedgerKindAlbum, LedgerKindGroupAlbum:
++		it.AlbumName = firstPathSegment(it.RelPath)
++		it.AlbumID = albumIDFromSource(vi.SourceID)
++		if it.SourceID == "" {
++			it.SourceID = LocalSourceID(it.RelPath)
++		}
++		// 只要能定位到相册（按相册名白名单或 ID），在线重跑就能按文件名补回。
++		it.AutoRepairable = it.AlbumName != ""
++	case LedgerKindShuoshuo, LedgerKindBoard:
++		fillMoodRepairHints(domain, &it)
++	}
++	return it
++}
++
++// splitMarker 从未完成明细中拆出最终目标 rel 与标记 rel。
++func splitMarker(vi VerifyItem) (target, marker string) {
++	rel := vi.RelPath
++	if strings.HasSuffix(rel, hlsPartExt2) {
++		return strings.TrimSuffix(rel, hlsPartExt2), rel
++	}
++	if strings.HasSuffix(rel, resumeSidecarExt) {
++		return strings.TrimSuffix(rel, resumeSidecarExt), rel
++	}
++	// 有条目的未完成：RelPath 是目标，Detail 形如「存在未完成标记: xxx」。
++	const prefix = "存在未完成标记: "
++	if strings.HasPrefix(vi.Detail, prefix) {
++		return rel, strings.TrimPrefix(vi.Detail, prefix)
++	}
++	return rel, ""
++}
++
++func verifyReasonToRepair(status string) string {
++	switch status {
++	case VerifyMissing:
++		return RepairReasonMissing
++	case VerifyIncomplete:
++		return RepairReasonIncomplete
++	default:
++		return RepairReasonChanged
++	}
++}
++
++func firstPathSegment(rel string) string {
++	rel = strings.TrimPrefix(filepath.ToSlash(rel), "./")
++	if i := strings.Index(rel, "/"); i >= 0 {
++		return rel[:i]
++	}
++	return ""
++}
++
++// albumIDFromSource 从 album:/group: 身份里解析相册 ID；local/其他身份返回空。
++func albumIDFromSource(sourceID string) string {
++	switch {
++	case strings.HasPrefix(sourceID, sourcePrefixGroup):
++		// group:<uin>:<gid>:<albumID>:<sloc>
++		parts := strings.SplitN(sourceID, ":", 5)
++		if len(parts) == 5 {
++			return parts[3]
++		}
++	case strings.HasPrefix(sourceID, sourcePrefixAlbum):
++		// album:<uin>:<albumID>:<sloc>
++		parts := strings.SplitN(sourceID, ":", 4)
++		if len(parts) == 4 {
++			return parts[2]
++		}
++	}
++	return ""
++}
++
++// fillMoodRepairHints 从 source_id 与本地 backup.json 补齐说说/留言板修复所需的 tid/媒体/URL。
++func fillMoodRepairHints(domain LedgerDomain, it *RepairItem) {
++	tid, mediaID, mediaURL := parseMoodSourceHint(it.SourceID)
++	it.TID, it.MediaID, it.MediaURL = tid, mediaID, mediaURL
++
++	// source 里只有 URL 摘要或完全没有身份（孤立半成品）时，用本地 backup.json 按路径找回。
++	var posts []MoodPost
++	switch domain.Kind {
++	case LedgerKindShuoshuo:
++		if f, err := loadMoodBackup(domain.Root); err == nil {
++			posts = f.Posts
++		}
++	case LedgerKindBoard:
++		if f, err := loadBoardBackup(domain.Root); err == nil {
++			posts = f.Posts
++		}
++	}
++	if len(posts) > 0 {
++		if ownerTID, m := findBackupMediaByRel(posts, it.RelPath); m != nil {
++			it.TID = ownerTID
++			if m.ID != "" {
++				it.MediaID = m.ID
++			}
++			if m.URL != "" {
++				it.MediaURL = m.URL
++			}
++			if it.SourceID == "" {
++				prefix := sourcePrefixShuo
++				if domain.Kind == LedgerKindBoard {
++					prefix = sourcePrefixBoard
++				}
++				it.SourceID = MoodMediaSourceID(prefix, domain.OwnerUin, ownerTID, m.ID, m.URL)
++			}
++		}
++	}
++	if it.SourceID == "" && it.RelPath != "" {
++		it.SourceID = LocalSourceID(it.RelPath)
++	}
++	it.AutoRepairable = it.TID != "" && (it.MediaID != "" || it.MediaURL != "")
++}
++
++// parseMoodSourceHint 解析 shuoshuo:/board: 身份里的 tid 与媒体要素。
++func parseMoodSourceHint(sourceID string) (tid, mediaID, mediaURL string) {
++	if strings.HasPrefix(sourceID, sourcePrefixShuo) || strings.HasPrefix(sourceID, sourcePrefixBoard) {
++		rest := strings.SplitN(sourceID, ":", 2)[1]
++		parts := strings.Split(rest, ":")
++		switch len(parts) {
++		case 3:
++			return parts[1], parts[2], "" // <uin>:<tid>:<mediaID>
++		case 4:
++			if parts[2] == "url" {
++				return parts[1], "", "" // <uin>:<tid>:url:<md5>
++			}
++		}
++	}
++	return "", "", ""
++}
++
++// findBackupMediaByRel 在说说/留言备份树里按本地相对路径找回媒体及其所属条目 tid。
++func findBackupMediaByRel(posts []MoodPost, rel string) (string, *MoodMedia) {
++	var walk func(tid string, cs []MoodComment) *MoodMedia
++	walk = func(tid string, cs []MoodComment) *MoodMedia {
++		for i := range cs {
++			for j := range cs[i].Media {
++				if cs[i].Media[j].Path == rel {
++					return &cs[i].Media[j]
++				}
++			}
++			if found := walk(tid, cs[i].Replies); found != nil {
++				return found
++			}
++		}
++		return nil
++	}
++	for i := range posts {
++		p := &posts[i]
++		for j := range p.Media {
++			if p.Media[j].Path == rel {
++				return p.TID, &p.Media[j]
++			}
++		}
++		if p.Repost != nil {
++			for j := range p.Repost.Media {
++				if p.Repost.Media[j].Path == rel {
++					return p.TID, &p.Repost.Media[j]
++				}
++			}
++		}
++		if found := walk(p.TID, p.Comments); found != nil {
++			return p.TID, found
++		}
++	}
++	return "", nil
++}
++
++// RepairRunner 抽象各备份类型的在线重建链路，生产实现复用 Spider/MoodBackup/BoardBackup。
++type RepairRunner interface {
++	RunAlbumRepair(ctx context.Context, kind LedgerKind, ownerUin, groupID string, selectors []string) (*DownloadResult, error)
++	RunMoodRepair(ctx context.Context, ownerUin string, items []FailedItem) (*DownloadResult, error)
++	RunBoardRepair(ctx context.Context, ownerUin string, items []FailedItem) (*DownloadResult, error)
++}
++
++// RepairOutcome 是一次修复运行的结果。
++type RepairOutcome struct {
++	Resolved     []RepairItem // 本次重建成功并重新登记
++	Remaining    []RepairItem // 仍失败（计划保留，下次继续）
++	Unrepairable []RepairItem // 无法自动修复（如缺少取源线索）
++	Result       *DownloadResult
++}
++
++// ExecuteRepair 执行修复：隔离 → 原链路重建 → 账本核对 → 计划移除成功项并原子保存。
++// 本函数不处理登录；调用方必须在登录成功后调用，否则直接返回错误且计划原样保留。
++func ExecuteRepair(ctx context.Context, domain LedgerDomain, plan *RepairPlan, runner RepairRunner, logger *zap.SugaredLogger) (*RepairOutcome, error) {
++	if plan == nil || runner == nil {
++		return nil, fmt.Errorf("repair plan/runner 不能为空")
++	}
++	outcome := &RepairOutcome{Result: &DownloadResult{}}
++
++	qRoot := filepath.Join(domain.Root, integrityDirName, "quarantine", time.Now().Format("20060101-150405"))
++
++	var runnable []RepairItem
++	for _, it := range plan.Items {
++		if !it.AutoRepairable {
++			outcome.Unrepairable = append(outcome.Unrepairable, it)
++			continue
++		}
++		// 只隔离计划内路径：目标文件（changed/incomplete）及它的 sidecar/.part 标记。
++		quarantineItem(domain.Root, qRoot, it, logger)
++		runnable = append(runnable, it)
++	}
++
++	if len(runnable) > 0 {
++		switch domain.Kind {
++		case LedgerKindAlbum, LedgerKindGroupAlbum:
++			selectors := albumSelectors(runnable)
++			res, err := runner.RunAlbumRepair(ctx, domain.Kind, plan.OwnerUin, plan.GroupID, selectors)
++			collectResult(outcome.Result, res)
++			if err != nil {
++				// 链路级异常（网络/登录）：计划保留不动，下次可继续。
++				return outcome, err
++			}
++			applyFailedErrors(plan, res)
++		case LedgerKindShuoshuo:
++			res, err := runner.RunMoodRepair(ctx, plan.OwnerUin, moodFailedItems(FailedKindShuoShuo, "说说", plan.OwnerUin, runnable))
++			collectResult(outcome.Result, res)
++			if err != nil {
++				return outcome, err
++			}
++			applyFailedErrors(plan, res)
++		case LedgerKindBoard:
++			res, err := runner.RunBoardRepair(ctx, plan.OwnerUin, moodFailedItems(FailedKindBoard, "留言板", plan.OwnerUin, runnable))
++			collectResult(outcome.Result, res)
++			if err != nil {
++				return outcome, err
++			}
++			applyFailedErrors(plan, res)
++		}
++	}
++
++	// 以账本 + 磁盘事实裁决每个计划项：rel 路径上的条目与文件大小/摘要一致才算成功。
++	// 同时接受「同一来源身份在新 rel 路径上健康」（Content-Type 改扩展名后文件改名）。
++	l, _ := LoadLedger(domain.Root)
++	remaining := append([]RepairItem(nil), outcome.Unrepairable...)
++	for _, it := range runnable {
++		if ledgerRelHealthy(l, it.RelPath) || ledgerSourceResolved(l, it.SourceID) {
++			outcome.Resolved = append(outcome.Resolved, it)
++			continue
++		}
++		if it.LastError == "" {
++			it.LastError = "链路执行后文件仍未达到账本健康状态（可能已不存在于空间或仍在失败列表）"
++		}
++		it.UpdatedAt = time.Now()
++		outcome.Remaining = append(outcome.Remaining, it)
++		remaining = append(remaining, it)
++	}
++
++	plan.Items = remaining
++	if err := plan.Save(); err != nil && logger != nil {
++		logger.Warnf("⚠️ 修复计划写回失败: %v", err)
++	}
++	return outcome, nil
++}
++
++// albumSelectors 收集相册修复白名单：相册名 + 相册 ID，保证特殊字符相册名也能命中。
++func albumSelectors(items []RepairItem) []string {
++	seen := map[string]bool{}
++	var out []string
++	add := func(v string) {
++		if v != "" && !seen[v] {
++			seen[v] = true
++			out = append(out, v)
++		}
++	}
++	for _, it := range items {
++		add(it.AlbumName)
++		add(it.AlbumID)
++	}
++	return out
++}
++
++// moodFailedItems 把说说/留言板计划项转成现有 RetryFailed 链路需要的 FailedItem。
++func moodFailedItems(kind, album, owner string, items []RepairItem) []FailedItem {
++	out := make([]FailedItem, 0, len(items))
++	for _, it := range items {
++		out = append(out, FailedItem{
++			Kind:      kind,
++			Album:     album,
++			Name:      it.RelPath,
++			TargetUin: owner,
++			MoodTID:   it.TID,
++			MediaID:   it.MediaID,
++			MediaURL:  it.MediaURL,
++			IsVideo:   it.MediaKind == MediaKindVideo,
++		})
++	}
++	return out
++}
++
++// quarantineItem 把计划内目标及其未完成标记移动到隔离区；缺失文件无需处理。
++func quarantineItem(root, qRoot string, it RepairItem, logger *zap.SugaredLogger) {
++	candidates := []string{it.RelPath}
++	if it.MarkerRelPath != "" && it.MarkerRelPath != it.RelPath {
++		candidates = append(candidates, it.MarkerRelPath)
++	}
++	// 标记路径可能在核验后变化，目标的两类标准标记也一并尝试。
++	candidates = append(candidates, it.RelPath+resumeSidecarExt, it.RelPath+hlsPartExt2)
++
++	for _, rel := range candidates {
++		if rel == "" || strings.HasPrefix(rel, "..") {
++			continue
++		}
++		src := filepath.Join(root, filepath.FromSlash(rel))
++		fi, err := os.Stat(src)
++		if err != nil || fi.IsDir() {
++			continue
++		}
++		dst := filepath.Join(qRoot, filepath.FromSlash(rel))
++		if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
++			if logger != nil {
++				logger.Warnf("⚠️ 建立隔离目录失败 %s: %v", rel, err)
++			}
++			continue
++		}
++		if err := os.Rename(src, dst); err != nil {
++			if logger != nil {
++				logger.Warnf("⚠️ 隔离文件失败 %s: %v", rel, err)
++			}
++			continue
++		}
++		if logger != nil {
++			logger.Infof("🧹 已隔离待修复文件: %s", rel)
++		}
++	}
++}
++
++// ledgerRelHealthy 判断账本中登记在 rel 路径上的条目当前是否与磁盘一致。
++func ledgerRelHealthy(l *Ledger, rel string) bool {
++	if l == nil {
++		return false
++	}
++	e, ok := l.FindByRelPath(rel)
++	if !ok {
++		return false
++	}
++	fi, err := os.Stat(filepath.Join(l.Root(), filepath.FromSlash(rel)))
++	if err != nil || !fi.Mode().IsRegular() || fi.Size() != e.Size {
++		return false
++	}
++	sum, err := util.FileSHA256(filepath.Join(l.Root(), filepath.FromSlash(rel)))
++	return err == nil && sum == e.SHA256
++}
++
++// ledgerSourceResolved 判断来源身份当前是否在（可能改名后的）路径上健康。
++// local 基线身份不适用——它本身就等于 rel，裁决交给 ledgerRelHealthy。
++func ledgerSourceResolved(l *Ledger, sourceID string) bool {
++	if l == nil || IsLocalSource(sourceID) {
++		return false
++	}
++	return l.SkipDecision(sourceID) == LedgerSkipHealthy
++}
++
++// collectResult 合并一次链路运行的计数。
++func collectResult(dst, src *DownloadResult) {
++	if src == nil {
++		return
++	}
++	dst.Total += src.Total
++	dst.Success += src.Success
++	dst.NewAdded += src.NewAdded
++	dst.Skipped += src.Skipped
++	dst.Failed += src.Failed
++	dst.VideoCount += src.VideoCount
++	dst.ImageCount += src.ImageCount
++	dst.BytesDone += src.BytesDone
++	dst.FailedItems = append(dst.FailedItems, src.FailedItems...)
++}
++
++// applyFailedErrors 把链路失败原因写回对应计划项（按 rel 路径或文件名匹配）。
++func applyFailedErrors(plan *RepairPlan, res *DownloadResult) {
++	if res == nil {
++		return
++	}
++	byRel := map[string]string{}
++	byBase := map[string]string{}
++	for _, f := range res.FailedItems {
++		byRel[f.Name] = f.Error
++		byBase[filepath.Base(f.Name)] = f.Error
++	}
++	for i := range plan.Items {
++		it := &plan.Items[i]
++		if msg := byRel[it.RelPath]; msg != "" {
++			it.LastError = msg
++			continue
++		}
++		if msg := byBase[filepath.Base(it.RelPath)]; msg != "" {
++			it.LastError = msg
++		}
++	}
++}
+diff --git a/internal/app/integrity_repair_runner.go b/internal/app/integrity_repair_runner.go
+new file mode 100644
+index 0000000..2fa7625
+--- /dev/null
++++ b/internal/app/integrity_repair_runner.go
+@@ -0,0 +1,45 @@
++// 定点修复的在线执行器：完全复用四类备份现有的取源、多候选换源、断点续传与失败重试链路，
++// 不另起任何下载实现。相册走白名单 Spider（增量 + 账本跳过），说说/留言板走 RetryFailed。
++
++package app
++
++import (
++	"context"
++
++	"github.com/qinjintian/qq-zone/internal/qzone"
++	"go.uber.org/zap"
++)
++
++// OnlineRepairRunner 用已登录客户端执行修复重建。
++type OnlineRepairRunner struct {
++	client *qzone.Client
++	config *Config
++	logger *zap.SugaredLogger
++}
++
++// NewOnlineRepairRunner 构造在线修复执行器。
++func NewOnlineRepairRunner(client *qzone.Client, config *Config, logger *zap.SugaredLogger) *OnlineRepairRunner {
++	return &OnlineRepairRunner{client: client, config: config, logger: logger}
++}
++
++// RunAlbumRepair 以增量模式、相册白名单跑受影响相册：
++// 缺失/已隔离的文件重新下载，健康文件由账本一致性闸门保证不重写。
++func (r *OnlineRepairRunner) RunAlbumRepair(ctx context.Context, kind LedgerKind, ownerUin, groupID string, selectors []string) (*DownloadResult, error) {
++	var spider *Spider
++	if kind == LedgerKindGroupAlbum {
++		spider = NewGroupSpider(r.client, r.config, selectors, groupID, "", r.logger)
++	} else {
++		spider = NewSpider(r.client, r.config, selectors, r.logger)
++	}
++	return spider.Download(ctx, ownerUin, true)
++}
++
++// RunMoodRepair 复用说说失败重试链路：按 tid 刷详情换地址、多候选 + getinfo 换源。
++func (r *OnlineRepairRunner) RunMoodRepair(ctx context.Context, ownerUin string, items []FailedItem) (*DownloadResult, error) {
++	return NewMoodBackup(r.client, r.config, r.logger).RetryFailed(ctx, ownerUin, items)
++}
++
++// RunBoardRepair 复用留言板失败重试链路。
++func (r *OnlineRepairRunner) RunBoardRepair(ctx context.Context, ownerUin string, items []FailedItem) (*DownloadResult, error) {
++	return NewBoardBackup(r.client, r.config, r.logger).RetryFailed(ctx, ownerUin, items)
++}
+diff --git a/internal/app/integrity_repair_test.go b/internal/app/integrity_repair_test.go
+new file mode 100644
+index 0000000..b32ff33
+--- /dev/null
++++ b/internal/app/integrity_repair_test.go
+@@ -0,0 +1,375 @@
++// 定点修复测试：计划生成/持久化、隔离范围、原链路复用（注入假执行器）、
++// 健康与未登记文件零接触、失败保留可续作、不可自动修复项跳过。
++
++package app
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"go.uber.org/zap"
++)
++
++// fakeRepairRunner 模拟在线链路：对 succeedRels 写入正确文件并登记 verified 条目；
++// failRels 进入失败结果；albumErr 模拟网络/登录级失败。
++type fakeRepairRunner struct {
++	root           string
++	kind           LedgerKind
++	owner, groupID string
++	succeedRels    []string
++	failRels       []string
++	albumErr       error
++	moodErr        error
++
++	gotSelectors []string
++	gotMoodItems []FailedItem
++	gotBoardItems []FailedItem
++	calls        int
++}
++
++func (r *fakeRepairRunner) simulateSuccess(rels []string) {
++	l, err := LoadLedger(r.root)
++	if err != nil {
++		panic(err)
++	}
++	for _, rel := range rels {
++		abs := filepath.Join(r.root, filepath.FromSlash(rel))
++		if err := os.MkdirAll(filepath.Dir(abs), os.ModePerm); err != nil {
++			panic(err)
++		}
++		content := "repaired:" + rel
++		if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
++			panic(err)
++		}
++		e, err := EntryFromFile(r.root, rel, "album:"+r.owner+":aid:"+filepath.Base(rel), true)
++		if r.kind == LedgerKindShuoshuo || r.kind == LedgerKindBoard {
++			prefix := sourcePrefixShuo
++			if r.kind == LedgerKindBoard {
++				prefix = sourcePrefixBoard
++			}
++			e.SourceID = MoodMediaSourceID(prefix, r.owner, "tid", "mid-"+filepath.Base(rel), "")
++		}
++		if err != nil {
++			panic(err)
++		}
++		l.Upsert(e)
++	}
++	if err := l.Save(); err != nil {
++		panic(err)
++	}
++}
++
++// failResult 构造含失败项的链路结果。
++func (r *fakeRepairRunner) failResult() *DownloadResult {
++	res := &DownloadResult{}
++	for _, rel := range r.failRels {
++		res.addFailedItem(FailedItem{Name: rel, Error: "simulated chain failure"})
++	}
++	return res
++}
++
++func (r *fakeRepairRunner) RunAlbumRepair(ctx context.Context, kind LedgerKind, owner, groupID string, selectors []string) (*DownloadResult, error) {
++	r.calls++
++	r.kind, r.owner, r.groupID, r.gotSelectors = kind, owner, groupID, selectors
++	if r.albumErr != nil {
++		return nil, r.albumErr
++	}
++	r.simulateSuccess(r.succeedRels)
++	return r.failResult(), nil
++}
++
++func (r *fakeRepairRunner) RunMoodRepair(ctx context.Context, owner string, items []FailedItem) (*DownloadResult, error) {
++	r.calls++
++	r.owner, r.gotMoodItems = owner, items
++	if r.moodErr != nil {
++		return nil, r.moodErr
++	}
++	r.simulateSuccess(r.succeedRels)
++	return r.failResult(), nil
++}
++
++func (r *fakeRepairRunner) RunBoardRepair(ctx context.Context, owner string, items []FailedItem) (*DownloadResult, error) {
++	r.calls++
++	r.owner, r.gotBoardItems = owner, items
++	if r.moodErr != nil {
++		return nil, r.moodErr
++	}
++	r.simulateSuccess(r.succeedRels)
++	return r.failResult(), nil
++}
++
++func buildAlbumRepairFixture(t *testing.T) (string, *VerifyReport, LedgerDomain, string, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	// 健康文件：修复中不得被写动。
++	hSize, hSum := writeMedia(t, root, "A/keep.jpg", "keep-bytes")
++	// 变更：将被隔离重建。
++	writeMedia(t, root, "A/bad.jpg", "corrupt")
++	// 未完成：目标 + sidecar。
++	writeMedia(t, root, "A/half.mp4", "half")
++	writeMedia(t, root, "A/half.mp4.resume.json", "{}")
++	// 未登记：修复不得触碰。
++	writeMedia(t, root, "A/extra.jpg", "extra")
++
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++	l.Upsert(LedgerEntry{SourceID: AlbumSourceID("10001", "aid1", "keep"), RelPath: "A/keep.jpg", Size: hSize, SHA256: hSum, OriginVerified: true, MediaKind: MediaKindImage})
++	l.Upsert(LedgerEntry{SourceID: AlbumSourceID("10001", "aid1", "bad"), RelPath: "A/bad.jpg", Size: 999, SHA256: "deadbeef", OriginVerified: true, MediaKind: MediaKindImage})
++	l.Upsert(LedgerEntry{SourceID: AlbumSourceID("10001", "aid1", "gone"), RelPath: "A/gone.jpg", Size: 5, SHA256: "beefdead", OriginVerified: true, MediaKind: MediaKindImage})
++	l.Upsert(LedgerEntry{SourceID: AlbumSourceID("10001", "aid1", "half"), RelPath: "A/half.mp4", Size: 10, SHA256: "zz", OriginVerified: true, MediaKind: MediaKindVideo})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	report, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	domain := LedgerDomain{Kind: LedgerKindAlbum, Root: root, OwnerUin: "10001", HasLedger: true}
++	return root, report, domain, "A/keep.jpg", "A/extra.jpg", "A/bad.jpg"
++}
++
++func TestRepairAlbumQuarantineRebuildAndHealthyUntouched(t *testing.T) {
++	root, report, domain, keepRel, extraRel, badRel := buildAlbumRepairFixture(t)
++	plan := NewRepairPlan(domain, report)
++	if err := plan.Save(); err != nil {
++		t.Fatal(err)
++	}
++	// 未登记项不得进入计划。
++	for _, it := range plan.Items {
++		if it.Reason == VerifyUnregistered || it.RelPath == extraRel {
++			t.Fatalf("未登记项不得入计划: %+v", it)
++		}
++		if !it.AutoRepairable || it.AlbumName != "A" {
++			t.Fatalf("相册计划项应可修复且带相册名: %+v", it)
++		}
++	}
++	if len(plan.Items) != 3 {
++		t.Fatalf("计划应有 3 项（changed/missing/incomplete），实际 %d", len(plan.Items))
++	}
++
++	keepPath := filepath.Join(root, filepath.FromSlash(keepRel))
++	keepStat, _ := os.Stat(keepPath)
++	extraPath := filepath.Join(root, filepath.FromSlash(extraRel))
++	extraStat, _ := os.Stat(extraPath)
++	beforePlan, _ := os.ReadFile(RepairPlanPath(root))
++
++	runner := &fakeRepairRunner{
++		root: root, kind: LedgerKindAlbum, owner: "10001",
++		succeedRels: []string{"A/bad.jpg", "A/gone.jpg", "A/half.mp4"},
++	}
++	outcome, err := ExecuteRepair(context.Background(), domain, plan, runner, zap.NewNop().Sugar())
++	if err != nil {
++		t.Fatalf("execute: %v", err)
++	}
++	if len(outcome.Resolved) != 3 || len(outcome.Remaining) != 0 {
++		t.Fatalf("修复裁决错误: resolved=%d remaining=%d", len(outcome.Resolved), len(outcome.Remaining))
++	}
++
++	// 白名单同时包含相册名与相册 ID。
++	var hasName, hasID bool
++	for _, s := range runner.gotSelectors {
++		if s == "A" {
++			hasName = true
++		}
++		if s == "aid1" {
++			hasID = true
++		}
++	}
++	if !hasName || !hasID {
++		t.Fatalf("修复白名单缺相册名/ID: %v", runner.gotSelectors)
++	}
++
++	// 健康与未登记文件 mtime 不变（零接触）。
++	if st, _ := os.Stat(keepPath); st.ModTime() != keepStat.ModTime() || st.Size() != keepStat.Size() {
++		t.Fatal("健康文件被修复过程写动")
++	}
++	if st, _ := os.Stat(extraPath); st.ModTime() != extraStat.ModTime() {
++		t.Fatal("未登记文件被修复过程写动")
++	}
++	// 变更/未完成文件进隔离区且保留相对结构。
++	if _, err := os.Stat(filepath.Join(root, ".integrity", "quarantine")) ; err != nil {
++		t.Fatal(err)
++	}
++	quarantineHas := func(suffix string) bool {
++		found := false
++		_ = filepath.Walk(filepath.Join(root, ".integrity", "quarantine"), func(path string, info os.FileInfo, err error) error {
++			if err != nil {
++				return nil
++			}
++			if !info.IsDir() && filepath.ToSlash(path) != "" {
++				if strings.HasSuffix(filepath.ToSlash(path), suffix) {
++					found = true
++				}
++			}
++			return nil
++		})
++		return found
++	}
++	if !quarantineHas("A/bad.jpg") || !quarantineHas("A/half.mp4.resume.json") {
++		t.Fatal("隔离区缺少变更文件或 sidecar 标记")
++	}
++	// 原位损坏文件已移走。
++	if st, err := os.Stat(filepath.Join(root, filepath.FromSlash(badRel))); err == nil && st.Size() == int64(len("corrupt")) {
++		t.Fatal("原位损坏文件应已被隔离，而不是留在原地")
++	}
++	// 全部解决：计划文件删除。
++	if _, err := os.ReadFile(RepairPlanPath(root)); !os.IsNotExist(err) {
++		t.Fatal("全部修复后计划文件应移除")
++	}
++	_ = beforePlan
++}
++
++func TestRepairFailureKeepsPlanAndContinues(t *testing.T) {
++	root, report, domain, _, _, _ := buildAlbumRepairFixture(t)
++	plan := NewRepairPlan(domain, report)
++	if err := plan.Save(); err != nil {
++		t.Fatal(err)
++	}
++	originalPlan, _ := os.ReadFile(RepairPlanPath(root))
++
++	// 第一轮：gone 失败，其余成功。
++	runner := &fakeRepairRunner{
++		root: root, kind: LedgerKindAlbum, owner: "10001",
++		succeedRels: []string{"A/bad.jpg", "A/half.mp4"},
++		failRels:    []string{"A/gone.jpg"},
++	}
++	outcome, err := ExecuteRepair(context.Background(), domain, plan, runner, zap.NewNop().Sugar())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(outcome.Resolved) != 2 || len(outcome.Remaining) != 1 {
++		t.Fatalf("首轮应 2 成功 1 残留，实际 %d/%d", len(outcome.Resolved), len(outcome.Remaining))
++	}
++	if outcome.Remaining[0].LastError == "" {
++		t.Fatal("残留项应记录失败原因")
++	}
++	persisted, err := LoadRepairPlan(root)
++	if err != nil || len(persisted.Items) != 1 || persisted.Items[0].RelPath != "A/gone.jpg" {
++		t.Fatalf("失败计划必须持久化供下次继续: %+v err=%v", persisted, err)
++	}
++
++	// 链路级异常（断网/无凭证）：计划文件保持原样。
++	plan2, _ := LoadRepairPlan(root)
++	runner2 := &fakeRepairRunner{root: root, kind: LedgerKindAlbum, owner: "10001", albumErr: errors.New("network down")}
++	if _, err := ExecuteRepair(context.Background(), domain, plan2, runner2, zap.NewNop().Sugar()); err == nil {
++		t.Fatal("链路异常应向上返回")
++	}
++	afterErr, _ := os.ReadFile(RepairPlanPath(root))
++	if string(afterErr) == "" {
++		t.Fatal("异常后计划不得丢失")
++	}
++	_ = originalPlan
++
++	// 第二轮续作：gone 成功。
++	plan3, _ := LoadRepairPlan(root)
++	runner3 := &fakeRepairRunner{root: root, kind: LedgerKindAlbum, owner: "10001", succeedRels: []string{"A/gone.jpg"}}
++	outcome3, err := ExecuteRepair(context.Background(), domain, plan3, runner3, zap.NewNop().Sugar())
++	if err != nil || len(outcome3.Resolved) != 1 || len(outcome3.Remaining) != 0 {
++		t.Fatalf("续作应 1 成功 0 残留: %+v err=%v", outcome3, err)
++	}
++	if _, err := os.ReadFile(RepairPlanPath(root)); !os.IsNotExist(err) {
++		t.Fatal("续作全部成功后计划应移除")
++	}
++}
++
++func TestRepairMoodReusesRetryChainAndSkipsUnrepairable(t *testing.T) {
++	root := t.TempDir()
++	// backup.json 里有一条可定位媒体。
++	backup := &MoodBackupFile{
++		UIN: "10001",
++		Posts: []MoodPost{{
++			TID: "tid1",
++			Media: []MoodMedia{{
++				ID: "mid1", Type: "image", URL: "https://x/1.jpg",
++				Path: "media/2020/01/a.jpg",
++			}},
++		}},
++	}
++	if err := saveMoodBackup(root, backup); err != nil {
++		t.Fatal(err)
++	}
++	mSize, mSum := writeMedia(t, root, "media/2020/02/ok.jpg", "ok")
++	// 损坏的已登记媒体 + 无身份孤立半成品（backup.json 里找不到）。
++	writeMedia(t, root, "media/2020/01/a.jpg", "bad-bytes")
++	writeMedia(t, root, "media/2019/12/orphan.mp4.part", "seg0")
++
++	l := NewLedger(LedgerKindShuoshuo, "10001", "", root)
++	l.Upsert(LedgerEntry{SourceID: ShuoshuoSourceID("10001", "tid1", "mid1", ""), RelPath: "media/2020/01/a.jpg", Size: 100, SHA256: "xx", OriginVerified: true, MediaKind: MediaKindImage})
++	l.Upsert(LedgerEntry{SourceID: ShuoshuoSourceID("10001", "tidok", "midok", ""), RelPath: "media/2020/02/ok.jpg", Size: mSize, SHA256: mSum, OriginVerified: true, MediaKind: MediaKindImage})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	report, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	domain := LedgerDomain{Kind: LedgerKindShuoshuo, Root: root, OwnerUin: "10001", HasLedger: true}
++	plan := NewRepairPlan(domain, report)
++
++	var repairable, unrepairable []RepairItem
++	for _, it := range plan.Items {
++		if it.AutoRepairable {
++			repairable = append(repairable, it)
++		} else {
++			unrepairable = append(unrepairable, it)
++		}
++	}
++	if len(repairable) != 1 || repairable[0].RelPath != "media/2020/01/a.jpg" {
++		t.Fatalf("可修复项错误: %+v", repairable)
++	}
++	if repairable[0].TID != "tid1" || repairable[0].MediaID != "mid1" || repairable[0].MediaURL != "https://x/1.jpg" {
++		t.Fatalf("说说取源提示补全错误: %+v", repairable[0])
++	}
++	if len(unrepairable) != 1 {
++		t.Fatalf("孤立 part 应不可自动修复: %+v", unrepairable)
++	}
++
++	runner := &fakeRepairRunner{root: root, kind: LedgerKindShuoshuo, owner: "10001", succeedRels: []string{"media/2020/01/a.jpg"}}
++	outcome, err := ExecuteRepair(context.Background(), domain, plan, runner, zap.NewNop().Sugar())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(runner.gotMoodItems) != 1 || runner.gotMoodItems[0].Kind != FailedKindShuoShuo || runner.gotMoodItems[0].MoodTID != "tid1" {
++		t.Fatalf("必须复用 RetryFailed FailedItem 链路: %+v", runner.gotMoodItems)
++	}
++	if len(outcome.Resolved) != 1 || len(outcome.Unrepairable) != 1 {
++		t.Fatalf("裁决错误: %+v", outcome)
++	}
++	// 不可修复项保留在计划中。
++	persisted, err := LoadRepairPlan(root)
++	if err != nil || len(persisted.Items) != 1 || persisted.Items[0].AutoRepairable {
++		t.Fatalf("不可修复项应保留待人工处理: %+v err=%v", persisted, err)
++	}
++}
++
++func TestRepairPlanPersistenceRoundTrip(t *testing.T) {
++	root := t.TempDir()
++	if HasPendingRepair(root) {
++		t.Fatal("新目录不应有计划")
++	}
++	p := &RepairPlan{Kind: LedgerKindBoard, OwnerUin: "10001", root: root,
++		Items: []RepairItem{{RelPath: "media/a.jpg", Reason: RepairReasonMissing, AutoRepairable: true, CreatedAt: time.Now()}}}
++	if err := p.Save(); err != nil {
++		t.Fatal(err)
++	}
++	if !HasPendingRepair(root) {
++		t.Fatal("保存后应能发现待修复计划")
++	}
++	got, err := LoadRepairPlan(root)
++	if err != nil || len(got.Items) != 1 || got.Kind != LedgerKindBoard {
++		t.Fatalf("计划往返错误: %+v err=%v", got, err)
++	}
++	got.Items = nil
++	if err := got.Save(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := LoadRepairPlan(root); err != ErrRepairPlanMissing {
++		t.Fatalf("空计划保存后应为 missing，实际 %v", err)
++	}
++}
+diff --git a/internal/app/integrity_verify.go b/internal/app/integrity_verify.go
+new file mode 100644
+index 0000000..7ab5b0a
+--- /dev/null
++++ b/internal/app/integrity_verify.go
+@@ -0,0 +1,319 @@
++// 离线完整性核验：无登录、无网络、不修改任何媒体文件或账本。
++// 输出四类稳定结果（缺失/内容变更/未登记/未完成）与健康统计（已验证/未验证）。
++
++package app
++
++import (
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++)
++
++// 核验结果状态。
++const (
++	VerifyHealthy      = "healthy"      // 账本条目与磁盘文件大小、摘要完全一致
++	VerifyMissing      = "missing"      // 账本登记的文件不存在
++	VerifyChanged      = "changed"      // 文件存在但字节数或摘要不一致
++	VerifyIncomplete   = "incomplete"   // 续传半成品（.resume.json）或 HLS 中间产物（.part）
++	VerifyUnregistered = "unregistered" // 在管理范围内但账本未登记
++)
++
++// 未完成标记后缀。
++const (
++	resumeSidecarExt = ".resume.json"
++	hlsPartExt2      = ".part"
++)
++
++// albumMetadataFile 是相册目录里导出的元数据，不属于核心媒体。
++const albumMetadataFile = "album_metadata.json"
++
++// VerifyItem 是一条核验明细。
++type VerifyItem struct {
++	Status         string `json:"status"`
++	RelPath        string `json:"rel_path"`
++	SourceID       string `json:"source_id,omitempty"`
++	MediaKind      string `json:"media_kind,omitempty"`
++	OriginVerified bool   `json:"origin_verified,omitempty"`
++	WantSize       int64  `json:"want_size,omitempty"`
++	GotSize        int64  `json:"got_size,omitempty"`
++	WantSHA256     string `json:"want_sha256,omitempty"`
++	GotSHA256      string `json:"got_sha256,omitempty"`
++	Detail         string `json:"detail,omitempty"` // 未完成时说明标记文件等
++}
++
++// VerifyReport 是一次核验的完整、可复现结果。
++type VerifyReport struct {
++	Kind              LedgerKind   `json:"kind"`
++	Root              string       `json:"root"`
++	HasLedger         bool         `json:"has_ledger"`
++	HealthyVerified   int          `json:"healthy_verified"`
++	HealthyUnverified int          `json:"healthy_unverified"`
++	Items             []VerifyItem `json:"items"`
++}
++
++// Section 返回某一状态的明细（结果按 rel_path 稳定排序）。
++func (r *VerifyReport) Section(status string) []VerifyItem {
++	if r == nil {
++		return nil
++	}
++	out := make([]VerifyItem, 0)
++	for _, it := range r.Items {
++		if it.Status == status {
++			out = append(out, it)
++		}
++	}
++	return out
++}
++
++// ProblemCount 返回除健康外四类问题总数。
++func (r *VerifyReport) ProblemCount() int {
++	if r == nil {
++		return 0
++	}
++	return len(r.Section(VerifyMissing)) + len(r.Section(VerifyChanged)) +
++		len(r.Section(VerifyIncomplete)) + len(r.Section(VerifyUnregistered))
++}
++
++// VerifyProgress 在哈希扫描过程中汇报进度（已完成文件数/总文件数），可为 nil。
++type VerifyProgress func(done, total int, currentRel string)
++
++// VerifyRoot 对单个域根做纯本地核验。
++// 账本不存在时返回 ErrLedgerMissing（调用方可引导用户建立基线或仅扫描）；不做任何写操作。
++func VerifyRoot(root string, progress VerifyProgress) (*VerifyReport, error) {
++	l, err := LoadLedger(root)
++	if err != nil {
++		return nil, err
++	}
++	return verifyWithLedger(root, l, progress), nil
++}
++
++// ScanRootWithoutLedger 用于没有账本的旧备份：只列管理范围内的现存媒体（全部算未登记）与未完成项。
++// 同样严格只读，不需要也不创建账本。
++func ScanRootWithoutLedger(kind LedgerKind, root string, progress VerifyProgress) *VerifyReport {
++	return verifyWithLedger(root, NewLedger(kind, "", "", root), progress)
++}
++
++// verifyWithLedger 执行核验；l 为空账本时所有现存媒体都会落入未登记。
++func verifyWithLedger(root string, l *Ledger, progress VerifyProgress) *VerifyReport {
++	mediaFiles, markers := scanManagedFiles(l.Kind, root)
++
++	report := &VerifyReport{Kind: l.Kind, Root: root, HasLedger: l.Count() > 0 || ledgerExists(root)}
++	consumed := make(map[string]bool) // 已被账本条目或未完成标记消费的磁盘文件
++	markerTargets := make(map[string]string)
++	for _, mk := range markers {
++		if prev, exists := markerTargets[mk.targetRel]; !exists || len(mk.markerRel) < len(prev) {
++			markerTargets[mk.targetRel] = mk.markerRel
++		}
++	}
++
++	total := len(l.Entries) + len(mediaFiles)
++	done := 0
++	tick := func(rel string) {
++		done++
++		if progress != nil {
++			progress(done, total, rel)
++		}
++	}
++
++	// 1) 逐条核对账本条目：缺失 → 未完成 → 大小 → 摘要 → 健康（顺序与 FR-5 一致）。
++	entries := append([]LedgerEntry(nil), l.Entries...)
++	sort.SliceStable(entries, func(i, j int) bool { return entries[i].RelPath < entries[j].RelPath })
++	for _, e := range entries {
++		abs := filepath.Join(root, filepath.FromSlash(e.RelPath))
++		fi, statErr := os.Stat(abs)
++		if statErr != nil || !fi.Mode().IsRegular() {
++			report.Items = append(report.Items, VerifyItem{
++				Status: VerifyMissing, RelPath: e.RelPath, SourceID: e.SourceID,
++				MediaKind: e.MediaKind, OriginVerified: e.OriginVerified, WantSize: e.Size,
++			})
++			tick(e.RelPath)
++			continue
++		}
++
++		if markerRel, incomplete := markerTargets[e.RelPath]; incomplete {
++			report.Items = append(report.Items, VerifyItem{
++				Status: VerifyIncomplete, RelPath: e.RelPath, SourceID: e.SourceID,
++				MediaKind: e.MediaKind, OriginVerified: e.OriginVerified,
++				GotSize: fi.Size(), Detail: "存在未完成标记: " + markerRel,
++			})
++			consumed[e.RelPath] = true
++			tick(e.RelPath)
++			continue
++		}
++
++		if fi.Size() != e.Size {
++			report.Items = append(report.Items, VerifyItem{
++				Status: VerifyChanged, RelPath: e.RelPath, SourceID: e.SourceID,
++				MediaKind: e.MediaKind, OriginVerified: e.OriginVerified,
++				WantSize: e.Size, GotSize: fi.Size(), WantSHA256: e.SHA256,
++				Detail: "字节数不一致",
++			})
++			consumed[e.RelPath] = true
++			tick(e.RelPath)
++			continue
++		}
++
++		gotSHA, hashErr := util.FileSHA256(abs)
++		if hashErr != nil || gotSHA != e.SHA256 {
++			item := VerifyItem{
++				Status: VerifyChanged, RelPath: e.RelPath, SourceID: e.SourceID,
++				MediaKind: e.MediaKind, OriginVerified: e.OriginVerified,
++				WantSize: e.Size, GotSize: fi.Size(), WantSHA256: e.SHA256,
++				GotSHA256: gotSHA, Detail: "内容摘要不一致",
++			}
++			if hashErr != nil {
++				item.Detail = "无法读取文件: " + hashErr.Error()
++			}
++			report.Items = append(report.Items, item)
++			consumed[e.RelPath] = true
++			tick(e.RelPath)
++			continue
++		}
++
++		if e.OriginVerified {
++			report.HealthyVerified++
++		} else {
++			report.HealthyUnverified++
++		}
++		consumed[e.RelPath] = true
++		tick(e.RelPath)
++	}
++
++	// 2) 未完成标记：目标存在但没有账本条目 → 未完成（连目标一起消费，避免再报未登记）；
++	//    目标不存在也没有账本条目 → 孤立标记，未完成。
++	entryByRel := make(map[string]LedgerEntry, len(entries))
++	for _, e := range entries {
++		entryByRel[e.RelPath] = e
++	}
++	markerSeen := make(map[string]bool)
++	for _, mk := range markers {
++		if markerSeen[mk.targetRel] {
++			continue
++		}
++		markerSeen[mk.targetRel] = true
++		if _, hasEntry := entryByRel[mk.targetRel]; hasEntry {
++			continue // 条目循环已按优先级处理
++		}
++		item := VerifyItem{
++			Status: VerifyIncomplete, RelPath: mk.targetRel, Detail: "存在未完成标记: " + mk.markerRel,
++			MediaKind: MediaKindFromExt(mk.targetRel),
++		}
++		if _, targetExists := mediaFiles[mk.targetRel]; targetExists {
++			consumed[mk.targetRel] = true
++		} else {
++			// 目标都不在了，直接把标记文件本身作为未完成明细。
++			item.RelPath = mk.markerRel
++		}
++		report.Items = append(report.Items, item)
++	}
++
++	// 3) 其余在管理范围内但账本没有的媒体文件 → 未登记。
++	rels := make([]string, 0, len(mediaFiles))
++	for rel := range mediaFiles {
++		if consumed[rel] {
++			continue
++		}
++		rels = append(rels, rel)
++	}
++	sort.Strings(rels)
++	for _, rel := range rels {
++		report.Items = append(report.Items, VerifyItem{
++			Status: VerifyUnregistered, RelPath: rel,
++			MediaKind: MediaKindFromExt(rel), GotSize: mediaFiles[rel],
++		})
++	}
++
++	sort.SliceStable(report.Items, func(i, j int) bool {
++		if report.Items[i].Status != report.Items[j].Status {
++			return report.Items[i].Status < report.Items[j].Status
++		}
++		return report.Items[i].RelPath < report.Items[j].RelPath
++	})
++	return report
++}
++
++// diskMarker 记录一个未完成标记文件及其对应的目标媒体 rel_path。
++type diskMarker struct {
++	markerRel string
++	targetRel string
++}
++
++// scanManagedFiles 只做文件系统读操作：返回管理范围内的候选媒体（rel→size）与未完成标记。
++// 相册/群相册：递归整个域根，排除 .integrity/、album_metadata.json、标记文件；
++// 说说/留言板：仅 media/ 目录，排除标记文件。
++func scanManagedFiles(kind LedgerKind, root string) (map[string]int64, []diskMarker) {
++	media := make(map[string]int64)
++	var markers []diskMarker
++
++	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
++		if err != nil {
++			return nil // 只读核验：遇到无权限/瞬时错误跳过，不中断整次扫描
++		}
++		if d.IsDir() {
++			return nil
++		}
++		rel, relErr := filepath.Rel(root, path)
++		if relErr != nil {
++			return nil
++		}
++		rel = filepath.ToSlash(rel)
++		if rel == "" || strings.HasPrefix(rel, "..") {
++			return nil
++		}
++
++		// 排除 .integrity/ 下所有内容（账本、修复计划、隔离区）。
++		if isUnderIntegrityDir(rel) {
++			return nil
++		}
++
++		name := d.Name()
++		// 标记识别必须先过管理范围：说说/留言板只关心 media/ 内的媒体，
++		// avatars 等辅助目录里的 sidecar/.part 既不算未完成也不算未登记（审查 F2）。
++		if !inManagedScope(kind, rel, name) {
++			return nil
++		}
++		switch {
++		case strings.HasSuffix(name, resumeSidecarExt):
++			markers = append(markers, diskMarker{markerRel: rel, targetRel: strings.TrimSuffix(rel, resumeSidecarExt)})
++			return nil
++		case strings.HasSuffix(name, hlsPartExt2):
++			markers = append(markers, diskMarker{markerRel: rel, targetRel: strings.TrimSuffix(rel, hlsPartExt2)})
++			return nil
++		}
++
++		if fi, statErr := d.Info(); statErr == nil {
++			media[rel] = fi.Size()
++		}
++		return nil
++	})
++	return media, markers
++}
++
++// isUnderIntegrityDir 判断 rel 是否位于域根的 .integrity/ 目录内（兼容多级）。
++func isUnderIntegrityDir(rel string) bool {
++	first := rel
++	if i := strings.Index(rel, "/"); i >= 0 {
++		first = rel[:i]
++	}
++	return first == integrityDirName
++}
++
++// inManagedScope 判断文件是否属于核心媒体扫描范围。
++func inManagedScope(kind LedgerKind, rel, name string) bool {
++	switch kind {
++	case LedgerKindShuoshuo, LedgerKindBoard:
++		return strings.HasPrefix(rel, "media/")
++	default:
++		// 相册/群相册：除元数据导出文件外，递归范围内的普通文件都算媒体。
++		return name != albumMetadataFile
++	}
++}
++
++// ledgerExists 仅用 stat 判断账本文件是否存在（读失败一律按不存在处理，避免核验报错中断）。
++func ledgerExists(root string) bool {
++	_, err := os.Stat(LedgerPath(root))
++	return err == nil
++}
+diff --git a/internal/app/integrity_verify_test.go b/internal/app/integrity_verify_test.go
+new file mode 100644
+index 0000000..a2ff745
+--- /dev/null
++++ b/internal/app/integrity_verify_test.go
+@@ -0,0 +1,270 @@
++// 离线核验器测试：四类分类正确性、重复运行稳定性、严格只读。
++
++package app
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"testing"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++)
++
++// treeDigest 对目录下所有文件做 路径+sha256 快照，用来证明核验零写入。
++func treeDigest(t *testing.T, root string) map[string]string {
++	t.Helper()
++	snap := map[string]string{}
++	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
++		if err != nil || d.IsDir() {
++			return err
++		}
++		rel, _ := filepath.Rel(root, path)
++		data, rErr := os.ReadFile(path)
++		if rErr != nil {
++			return rErr
++		}
++		sum := sha256.Sum256(data)
++		snap[filepath.ToSlash(rel)] = hex.EncodeToString(sum[:])
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return snap
++}
++
++func saveLedgerForVerify(t *testing.T, root string, entries []LedgerEntry) *Ledger {
++	t.Helper()
++	ledger := NewLedger(LedgerKindAlbum, "10001", "", root)
++	for _, e := range entries {
++		ledger.Upsert(e)
++	}
++	if err := ledger.Save(); err != nil {
++		t.Fatal(err)
++	}
++	return ledger
++}
++
++func TestVerifyAlbumFixtureAllCategories(t *testing.T) {
++	root := t.TempDir()
++
++	// 健康（已验证）
++	hSize, hSum := writeMedia(t, root, "A/ok1.jpg", "healthy-1")
++	// 健康（基线未验证）
++	uSize, uSum := writeMedia(t, root, "A/ok2.jpg", "healthy-2")
++	// 缺失：不写文件
++	// 大小不一致
++	cSize, cSum := writeMedia(t, root, "A/changed1.jpg", "changed-size")
++	// 摘要不一致（大小保持一致）
++	changedHash := "same-size"
++	writeMedia(t, root, "A/changed2.jpg", changedHash)
++	// 未完成：目标文件 + sidecar
++	writeMedia(t, root, "A/half.mp4", "half-bytes")
++	if err := os.WriteFile(filepath.Join(root, "A/half.mp4.resume.json"), []byte(`{"uri":"x"}`), 0644); err != nil {
++		t.Fatal(err)
++	}
++	// 孤立 HLS 半成品（无最终文件、无条目）
++	writeMedia(t, root, "A/ghost.mp4.part", "seg0")
++	// 未登记文件
++	writeMedia(t, root, "A/extra.jpg", "extra")
++	// 应排除：相册元数据
++	writeMedia(t, root, "A/album_metadata.json", "{}")
++
++	sameSize := int64(len(changedHash))
++	sameSum := sha256Hex(changedHash)
++	entries := []LedgerEntry{
++		{SourceID: "album:10001:a1:ok1", RelPath: "A/ok1.jpg", Size: hSize, SHA256: hSum, OriginVerified: true, MediaKind: MediaKindImage},
++		{SourceID: LocalSourceID("A/ok2.jpg"), RelPath: "A/ok2.jpg", Size: uSize, SHA256: uSum, OriginVerified: false, MediaKind: MediaKindImage},
++		{SourceID: "album:10001:a1:gone", RelPath: "A/gone.jpg", Size: 10, SHA256: "x", OriginVerified: true, MediaKind: MediaKindImage},
++		{SourceID: "album:10001:a1:c1", RelPath: "A/changed1.jpg", Size: cSize + 5, SHA256: cSum, OriginVerified: true, MediaKind: MediaKindImage},
++		{SourceID: "album:10001:a1:c2", RelPath: "A/changed2.jpg", Size: sameSize, SHA256: differentSameLenHex(sameSum), OriginVerified: true, MediaKind: MediaKindImage},
++		{SourceID: "album:10001:a1:half", RelPath: "A/half.mp4", Size: 999, SHA256: "z", OriginVerified: true, MediaKind: MediaKindVideo},
++	}
++	saveLedgerForVerify(t, root, entries)
++
++	before := treeDigest(t, root)
++	r1, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatalf("verify: %v", err)
++	}
++	r2, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatalf("verify2: %v", err)
++	}
++	after := treeDigest(t, root)
++
++	// TR-5.3：核验零写入。
++	if !reflect.DeepEqual(before, after) {
++		t.Fatal("核验前后文件树不一致：核验产生了写入")
++	}
++	// TR-5.2：两次结果完全一致。
++	if !reflect.DeepEqual(r1, r2) {
++		t.Fatal("两次核验结果必须逐字段一致")
++	}
++
++	if n := len(r1.Section(VerifyMissing)); n != 1 || r1.Section(VerifyMissing)[0].RelPath != "A/gone.jpg" {
++		t.Fatalf("缺失分类错误: %+v", r1.Section(VerifyMissing))
++	}
++	changed := r1.Section(VerifyChanged)
++	if len(changed) != 2 {
++		t.Fatalf("变更应有 2 项（大小+摘要），实际 %d: %+v", len(changed), changed)
++	}
++	var sawSize, sawHash bool
++	for _, c := range changed {
++		if c.Detail == "字节数不一致" {
++			sawSize = true
++		}
++		if c.Detail == "内容摘要不一致" {
++			sawHash = true
++		}
++	}
++	if !sawSize || !sawHash {
++		t.Fatalf("变更明细缺少子类型: size=%v hash=%v", sawSize, sawHash)
++	}
++	incomp := r1.Section(VerifyIncomplete)
++	if len(incomp) != 2 {
++		t.Fatalf("未完成应有 2 项（sidecar+孤立 part），实际 %d: %+v", len(incomp), incomp)
++	}
++	var incompRels []string
++	for _, it := range incomp {
++		incompRels = append(incompRels, it.RelPath)
++	}
++	sort.Strings(incompRels)
++	if len(incompRels) != 2 || incompRels[0] != "A/ghost.mp4.part" || incompRels[1] != "A/half.mp4" {
++		t.Fatalf("未完成明细错误: %v", incompRels)
++	}
++	unreg := r1.Section(VerifyUnregistered)
++	if len(unreg) != 1 || unreg[0].RelPath != "A/extra.jpg" {
++		t.Fatalf("未登记分类错误（元数据与 .integrity 必须排除）: %+v", unreg)
++	}
++	if r1.HealthyVerified != 1 || r1.HealthyUnverified != 1 {
++		t.Fatalf("健康统计错误: verified=%d unverified=%d", r1.HealthyVerified, r1.HealthyUnverified)
++	}
++	if r1.ProblemCount() != 6 {
++		t.Fatalf("问题总数 = %d, want 6", r1.ProblemCount())
++	}
++}
++
++func TestVerifyMoodScopeExcludesAuxiliary(t *testing.T) {
++	root := t.TempDir()
++	// 媒体范围内 1 个登记健康 + 1 个未登记。
++	mSize, mSum := writeMedia(t, root, "media/2020/02/a.jpg", "mood")
++	writeMedia(t, root, "media/2020/02/b.jpg", "unreg")
++	// 辅助文件一律不算未登记。
++	writeMedia(t, root, "avatars/10001.jpg", "face")
++	writeMedia(t, root, "assets/viewer.js", "js")
++	writeMedia(t, root, "data/backup.json", "{}")
++	writeMedia(t, root, "raw/page_1.json", "{}")
++	writeMedia(t, root, "index.html", "<html>")
++
++	l := NewLedger(LedgerKindShuoshuo, "10001", "", root)
++	l.Upsert(LedgerEntry{
++		SourceID: ShuoshuoSourceID("10001", "tid", "mid", ""), RelPath: "media/2020/02/a.jpg",
++		Size: mSize, SHA256: mSum, OriginVerified: true, MediaKind: MediaKindImage,
++	})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	r, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if r.Kind != LedgerKindShuoshuo || r.HealthyVerified != 1 {
++		t.Fatalf("说说健康统计错误: %+v", r)
++	}
++	unreg := r.Section(VerifyUnregistered)
++	if len(unreg) != 1 || unreg[0].RelPath != "media/2020/02/b.jpg" {
++		t.Fatalf("说说只应扫描 media/：%+v", unreg)
++	}
++	if r.ProblemCount() != 1 {
++		t.Fatalf("辅助文件不得制造噪声，问题数 = %d", r.ProblemCount())
++	}
++}
++
++func TestVerifyMoodIgnoresMarkersOutsideMediaScope(t *testing.T) {
++	root := t.TempDir()
++	writeMedia(t, root, "media/2020/01/a.jpg", "a")
++	// avatars 等辅助目录的残留 sidecar/.part 是真实场景，但按范围约定不得报未完成/未登记。
++	writeMedia(t, root, "avatars/10001.jpg", "face")
++	writeMedia(t, root, "avatars/10001.jpg.resume.json", "{}")
++	writeMedia(t, root, "avatars/x.mp4.part", "seg")
++	writeMedia(t, root, "assets/v.js.part", "js")
++
++	l := NewLedger(LedgerKindShuoshuo, "10001", "", root)
++	size, sum := digestVerifyMedia(t, root, "media/2020/01/a.jpg")
++	l.Upsert(LedgerEntry{SourceID: ShuoshuoSourceID("10001", "t", "m", ""), RelPath: "media/2020/01/a.jpg", Size: size, SHA256: sum, OriginVerified: true, MediaKind: MediaKindImage})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	r, err := VerifyRoot(root, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if r.ProblemCount() != 0 {
++		t.Fatalf("media/ 之外的标记不得产生任何问题项: %+v", r.Items)
++	}
++	if r.HealthyVerified != 1 {
++		t.Fatalf("仅 media 内 1 个健康文件，实际 verified=%d", r.HealthyVerified)
++	}
++
++	// 无账本扫描同样忽略范围外标记；media 内文件按无账本语义报未登记。
++	r2 := ScanRootWithoutLedger(LedgerKindShuoshuo, root, nil)
++	if len(r2.Section(VerifyIncomplete)) != 0 {
++		t.Fatalf("范围外标记不得报未完成: %+v", r2.Section(VerifyIncomplete))
++	}
++	unreg := r2.Section(VerifyUnregistered)
++	if len(unreg) != 1 || unreg[0].RelPath != "media/2020/01/a.jpg" {
++		t.Fatalf("仅 media 内 1 个文件应报未登记: %+v", unreg)
++	}
++}
++
++// digestVerifyMedia 取夹具文件 size+摘要。
++func digestVerifyMedia(t *testing.T, root, rel string) (int64, string) {
++	t.Helper()
++	size, sum, err := util.FileDigest(filepath.Join(root, filepath.FromSlash(rel)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return size, sum
++}
++
++func TestVerifyMissingLedgerAndScanOnly(t *testing.T) {
++	root := t.TempDir()
++	if _, err := VerifyRoot(root, nil); err != ErrLedgerMissing {
++		t.Fatalf("无账本应返回 ErrLedgerMissing，实际 %v", err)
++	}
++	writeMedia(t, root, "media/2020/01/x.jpg", "x")
++	writeMedia(t, root, "media/2020/01/y.mp4.part", "p")
++	r := ScanRootWithoutLedger(LedgerKindBoard, root, nil)
++	if r.HasLedger {
++		t.Fatal("仅扫描不应声称存在账本")
++	}
++	if len(r.Section(VerifyUnregistered)) != 1 || len(r.Section(VerifyIncomplete)) != 1 {
++		t.Fatalf("无账本扫描分类错误: %+v", r.Items)
++	}
++}
++
++// sha256Hex 返回内容的小写十六进制 SHA-256。
++func sha256Hex(s string) string {
++	sum := sha256.Sum256([]byte(s))
++	return hex.EncodeToString(sum[:])
++}
++
++// differentSameLenHex 构造与入参等长但确定不同的十六进制串。
++func differentSameLenHex(x string) string {
++	b := []byte(x)
++	for i := range b {
++		if b[i] == '0' {
++			b[i] = '1'
++		} else {
++			b[i] = '0'
++		}
++	}
++	return string(b)
++}
+diff --git a/internal/app/ledger.go b/internal/app/ledger.go
+new file mode 100644
+index 0000000..63459fe
+--- /dev/null
++++ b/internal/app/ledger.go
+@@ -0,0 +1,583 @@
++// 媒体完整性账本：四类备份（个人相册/群相册/说说/留言板）各自的持久媒体登记。
++// 仅登记真正完成并关闭的文件，条目含稳定来源身份、实际相对路径、字节数与 SHA-256。
++// 写入一律走「同目录临时文件写完整 → Sync → 原子 rename」，崩溃或取消后上一份账本仍可解析。
++
++package app
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++)
++
++const (
++	// ledgerVersion 是 ledger.json 的结构版本。
++	ledgerVersion = 1
++	// ledgerHashAlg 是账本使用的内容摘要算法。
++	ledgerHashAlg = "sha256"
++	// integrityDirName 是各备份域根下存放账本/修复计划/隔离区的隐藏目录。
++	integrityDirName = ".integrity"
++	// ledgerFileName / ledgerBackupFileName 分别是当前账本与最近完好备份。
++	ledgerFileName       = "ledger.json"
++	ledgerBackupFileName = "ledger.bak"
++)
++
++// LedgerKind 标识账本属于哪一类备份。
++type LedgerKind string
++
++const (
++	LedgerKindAlbum      LedgerKind = "album"       // 个人相册（含好友相册），目录 album/
++	LedgerKindGroupAlbum LedgerKind = "group_album" // 群相册，目录 qun/<群号>/
++	LedgerKindShuoshuo   LedgerKind = "shuoshuo"    // 说说
++	LedgerKindBoard      LedgerKind = "board"       // 留言板
++)
++
++// 稳定来源身份前缀，格式见 FR-1，任何登记/修复代码都应通过下面的构造器生成。
++const (
++	sourcePrefixAlbum = "album:"
++	sourcePrefixGroup = "group:"
++	sourcePrefixShuo  = "shuoshuo:"
++	sourcePrefixBoard = "board:"
++	sourcePrefixLocal = "local:"
++)
++
++// 媒体条目类型。
++const (
++	MediaKindImage = "image"
++	MediaKindVideo = "video"
++	MediaKindVoice = "voice"
++	MediaKindOther = "other"
++)
++
++// LedgerEntry 是单个完成态媒体文件的完整性登记。
++type LedgerEntry struct {
++	SourceID       string    `json:"source_id"`       // 稳定来源身份（FR-1 格式）
++	MediaKind      string    `json:"media_kind"`      // image / video / voice / other
++	RelPath        string    `json:"rel_path"`        // 相对域根的 POSIX 风格路径
++	Size           int64     `json:"size"`            // 字节数
++	SHA256         string    `json:"sha256"`          // 内容摘要（小写十六进制）
++	OriginVerified bool      `json:"origin_verified"` // true=字节确实来自成功的在线下载；false=本地基线，未与空间原件核对
++	CreatedAt      time.Time `json:"created_at"`      // 该身份首次登记时间
++	UpdatedAt      time.Time `json:"updated_at"`      // 最近一次内容更新时间
++}
++
++// Ledger 是一个备份域根的完整账本。
++type Ledger struct {
++	Version   int           `json:"version"`
++	Kind      LedgerKind    `json:"kind"`
++	OwnerUin  string        `json:"owner_uin"`          // 域根归属 QQ：相册/说说/留言板为目标 QQ，群相册为登录 QQ
++	GroupID   string        `json:"group_id,omitempty"` // 仅群相册
++	HashAlg   string        `json:"hash_alg"`
++	CreatedAt time.Time     `json:"created_at"`
++	UpdatedAt time.Time     `json:"updated_at"`
++	Entries   []LedgerEntry `json:"entries"`
++
++	root      string         `json:"-"` // 域根绝对/相对路径，不序列化
++	bySource  map[string]int `json:"-"` // source_id → Entries 下标
++	byRelPath map[string]int `json:"-"` // rel_path → Entries 下标
++}
++
++// LedgerDomain 描述本机发现的一个备份域根，供菜单选择与核验入口使用。
++type LedgerDomain struct {
++	Kind       LedgerKind
++	Root       string // 域根路径
++	OwnerUin   string
++	GroupID    string
++	HasLedger  bool // ledger.json 是否存在
++	EntryCount int  // 可解析账本的条目数
++	Corrupt    bool // 账本存在但 json/bak 都无法解析
++}
++
++// AlbumLedgerRoot 返回个人相册域根 storage/qzone/<QQ>/album。
++func AlbumLedgerRoot(targetUin string) string {
++	return filepath.Join("storage", "qzone", targetUin, "album")
++}
++
++// GroupLedgerRoot 返回群相册域根 storage/qzone/<登录QQ>/qun/<群号>。
++func GroupLedgerRoot(operatorUin, groupID string) string {
++	return filepath.Join("storage", "qzone", operatorUin, "qun", sanitizePath(groupID))
++}
++
++// ShuoshuoLedgerRoot 返回说说域根，复用 moodRoot。
++func ShuoshuoLedgerRoot(targetUin string) string {
++	return moodRoot(targetUin)
++}
++
++// BoardLedgerRoot 返回留言板域根，复用 boardRoot。
++func BoardLedgerRoot(targetUin string) string {
++	return boardRoot(targetUin)
++}
++
++// LedgerPath 返回域根内账本文件路径。
++func LedgerPath(root string) string {
++	return filepath.Join(root, integrityDirName, ledgerFileName)
++}
++
++// AlbumSourceID 构造个人相册媒体的稳定身份：album:<目标QQ>:<相册ID>:<sloc>。
++func AlbumSourceID(targetUin, albumID, sloc string) string {
++	return sourcePrefixAlbum + strings.Join([]string{targetUin, albumID, sloc}, ":")
++}
++
++// GroupSourceID 构造群相册媒体的稳定身份：group:<登录QQ>:<群号>:<相册ID>:<sloc>。
++func GroupSourceID(operatorUin, groupID, albumID, sloc string) string {
++	return sourcePrefixGroup + strings.Join([]string{operatorUin, groupID, albumID, sloc}, ":")
++}
++
++// MoodMediaSourceID 构造说说/留言板媒体的稳定身份。
++// prefix 为 shuoshuo: 或 board:；媒体 ID 为空时退化为 url:<MD5(URL)>，与现有文件名派生口径一致。
++func MoodMediaSourceID(prefix, targetUin, tid, mediaID, mediaURL string) string {
++	if strings.TrimSpace(mediaID) != "" {
++		return prefix + strings.Join([]string{targetUin, tid, mediaID}, ":")
++	}
++	return prefix + strings.Join([]string{targetUin, tid, "url", util.MD5(mediaURL)}, ":")
++}
++
++// ShuoshuoSourceID / BoardSourceID 是 MoodMediaSourceID 的类型化包装。
++func ShuoshuoSourceID(targetUin, tid, mediaID, mediaURL string) string {
++	return MoodMediaSourceID(sourcePrefixShuo, targetUin, tid, mediaID, mediaURL)
++}
++
++// BoardSourceID 构造留言板媒体身份。
++func BoardSourceID(targetUin, tid, mediaID, mediaURL string) string {
++	return MoodMediaSourceID(sourcePrefixBoard, targetUin, tid, mediaID, mediaURL)
++}
++
++// LocalSourceID 构造离线基线身份：local:<rel_path>，始终代表来源未验证条目。
++func LocalSourceID(relPath string) string {
++	return sourcePrefixLocal + relPath
++}
++
++// IsLocalSource 判断身份是否为本地基线身份。
++func IsLocalSource(sourceID string) bool {
++	return strings.HasPrefix(sourceID, sourcePrefixLocal)
++}
++
++// MediaKindFromExt 按文件扩展名推断媒体类型。
++func MediaKindFromExt(name string) string {
++	switch strings.ToLower(filepath.Ext(name)) {
++	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp":
++		return MediaKindImage
++	case ".mp4", ".mov", ".m4v", ".avi", ".mkv":
++		return MediaKindVideo
++	case ".mp3", ".m4a", ".aac", ".amr":
++		return MediaKindVoice
++	default:
++		return MediaKindOther
++	}
++}
++
++// NewLedger 创建一本尚未落盘的空账本。
++func NewLedger(kind LedgerKind, ownerUin, groupID, root string) *Ledger {
++	now := time.Now()
++	l := &Ledger{
++		Version:   ledgerVersion,
++		Kind:      kind,
++		OwnerUin:  ownerUin,
++		GroupID:   groupID,
++		HashAlg:   ledgerHashAlg,
++		CreatedAt: now,
++		UpdatedAt: now,
++		Entries:   nil,
++		root:      root,
++	}
++	l.rebuildIndex()
++	return l
++}
++
++// Root 返回账本域根路径。
++func (l *Ledger) Root() string { return l.root }
++
++// Count 返回条目数。
++func (l *Ledger) Count() int {
++	if l == nil {
++		return 0
++	}
++	return len(l.Entries)
++}
++
++// rebuildIndex 根据当前 Entries 重建 source/path 下标。
++func (l *Ledger) rebuildIndex() {
++	l.bySource = make(map[string]int, len(l.Entries))
++	l.byRelPath = make(map[string]int, len(l.Entries))
++	for i, e := range l.Entries {
++		l.bySource[e.SourceID] = i
++		if _, exists := l.byRelPath[e.RelPath]; !exists {
++			l.byRelPath[e.RelPath] = i
++		}
++	}
++}
++
++// FindBySource 按稳定来源身份查找条目。
++func (l *Ledger) FindBySource(sourceID string) (LedgerEntry, bool) {
++	if l == nil {
++		return LedgerEntry{}, false
++	}
++	i, ok := l.bySource[sourceID]
++	if !ok {
++		return LedgerEntry{}, false
++	}
++	return l.Entries[i], true
++}
++
++// FindByRelPath 按相对路径查找条目。
++func (l *Ledger) FindByRelPath(relPath string) (LedgerEntry, bool) {
++	if l == nil {
++		return LedgerEntry{}, false
++	}
++	i, ok := l.byRelPath[relPath]
++	if !ok {
++		return LedgerEntry{}, false
++	}
++	return l.Entries[i], true
++}
++
++// Upsert 按 source_id 插入或更新一条；同一 source 保留首次 CreatedAt。
++// 已验证（在线下载）条目落账时，同 rel_path 上的 local: 基线条目会被替换，
++// 因为该路径的字节已经被空间来源身份正式接管。
++func (l *Ledger) Upsert(e LedgerEntry) {
++	now := time.Now()
++	if e.CreatedAt.IsZero() {
++		e.CreatedAt = now
++	}
++	e.UpdatedAt = now
++
++	// 一个相对路径只能对应一个身份：已验证（在线下载/修复）条目接管同路径上的旧条目，
++	// 无论旧条目是 local 基线还是历史空间身份（文件名由 sloc 稳定派生，正常情况下身份相同）。
++	if e.OriginVerified {
++		if i, ok := l.byRelPath[e.RelPath]; ok && l.Entries[i].SourceID != e.SourceID {
++			l.removeAt(i)
++		}
++	}
++
++	if i, ok := l.bySource[e.SourceID]; ok {
++		old := l.Entries[i]
++		e.CreatedAt = old.CreatedAt
++		l.Entries[i] = e
++		// 同一来源改了 rel（如 Content-Type 改扩展名）时，必须摘掉旧 rel 键，避免陈旧命中。
++		if old.RelPath != e.RelPath {
++			delete(l.byRelPath, old.RelPath)
++		}
++		l.byRelPath[e.RelPath] = i
++		return
++	}
++
++	l.Entries = append(l.Entries, e)
++	idx := len(l.Entries) - 1
++	l.bySource[e.SourceID] = idx
++	if _, exists := l.byRelPath[e.RelPath]; !exists {
++		l.byRelPath[e.RelPath] = idx
++	}
++}
++
++// removeAt 删除下标处条目并重建下标（条目规模下足够简单可靠）。
++func (l *Ledger) removeAt(i int) {
++	if i < 0 || i >= len(l.Entries) {
++		return
++	}
++	l.Entries = append(l.Entries[:i], l.Entries[i+1:]...)
++	l.rebuildIndex()
++}
++
++// RemoveByRelPathPrefix 删除 rel_path 以 prefix 开头的全部条目。
++// 全量（非增量）相册备份整相册重下后，用它以本次成果整体替换该相册旧登记。
++// 返回被删除的条目数。
++func (l *Ledger) RemoveByRelPathPrefix(prefix string) int {
++	if l == nil || prefix == "" {
++		return 0
++	}
++	kept := l.Entries[:0]
++	removed := 0
++	for _, e := range l.Entries {
++		if strings.HasPrefix(e.RelPath, prefix) {
++			removed++
++			continue
++		}
++		kept = append(kept, e)
++	}
++	l.Entries = kept
++	l.rebuildIndex()
++	return removed
++}
++
++// Remove 按 source_id 删除条目，返回是否删过。
++func (l *Ledger) Remove(sourceID string) bool {
++	if l == nil {
++		return false
++	}
++	i, ok := l.bySource[sourceID]
++	if !ok {
++		return false
++	}
++	l.removeAt(i)
++	return true
++}
++
++// LedgerSkipDecision 是「本地文件能否依据账本直接跳过下载」的纯本地判定。
++type LedgerSkipDecision int
++
++const (
++	// LedgerSkipNoEntry：账本里没有该来源身份，调用方沿用旧的（HEAD/非空）跳过逻辑。
++	LedgerSkipNoEntry LedgerSkipDecision = iota
++	// LedgerSkipHealthy：条目登记的路径上现存文件大小与摘要均一致，可离线跳过，不得再发网络请求。
++	LedgerSkipHealthy
++	// LedgerSkipMismatch：有条目但文件缺失/大小或摘要不一致，必须进入下载链路重建，禁止跳过。
++	LedgerSkipMismatch
++)
++
++// SkipDecision 按来源身份查账本并核对条目登记路径上的现存文件，全程不访问网络。
++// 这是「凡是根据账本声称健康或跳过的媒体，其路径和内容必须与持久记录一致」的统一闸门，
++// 个人相册、群相册、说说、留言板四条链路共用。
++func (l *Ledger) SkipDecision(sourceID string) LedgerSkipDecision {
++	if l == nil {
++		return LedgerSkipNoEntry
++	}
++	e, ok := l.FindBySource(sourceID)
++	if !ok {
++		return LedgerSkipNoEntry
++	}
++	fi, err := os.Stat(filepath.Join(l.root, filepath.FromSlash(e.RelPath)))
++	if err != nil || !fi.Mode().IsRegular() || fi.Size() <= 0 {
++		return LedgerSkipMismatch
++	}
++	if fi.Size() != e.Size {
++		return LedgerSkipMismatch
++	}
++	sum, err := util.FileSHA256(filepath.Join(l.root, filepath.FromSlash(e.RelPath)))
++	if err != nil || sum != e.SHA256 {
++		return LedgerSkipMismatch
++	}
++	return LedgerSkipHealthy
++}
++
++// EntryFromFile 对一个已完成的本地文件计算登记条目（字节数 + SHA-256 一次扫描得到）。
++// relPath 必须是相对域根的 POSIX 风格路径。
++func EntryFromFile(root, relPath, sourceID string, originVerified bool) (LedgerEntry, error) {
++	abs := filepath.Join(root, filepath.FromSlash(relPath))
++	size, sum, err := util.FileDigest(abs)
++	if err != nil {
++		return LedgerEntry{}, err
++	}
++	now := time.Now()
++	return LedgerEntry{
++		SourceID:       sourceID,
++		MediaKind:      MediaKindFromExt(relPath),
++		RelPath:        relPath,
++		Size:           size,
++		SHA256:         sum,
++		OriginVerified: originVerified,
++		CreatedAt:      now,
++		UpdatedAt:      now,
++	}, nil
++}
++
++// Save 以原子替换方式写出 ledger.json，并在替换成功后刷新 ledger.bak。
++// 调用方必须先把整次备份/修复的新状态在内存中合并完整，再调用本函数。
++func (l *Ledger) Save() error {
++	if l == nil {
++		return errors.New("nil ledger")
++	}
++	l.Version = ledgerVersion
++	if l.HashAlg == "" {
++		l.HashAlg = ledgerHashAlg
++	}
++	sort.SliceStable(l.Entries, func(i, j int) bool {
++		if l.Entries[i].RelPath == l.Entries[j].RelPath {
++			return l.Entries[i].SourceID < l.Entries[j].SourceID
++		}
++		return l.Entries[i].RelPath < l.Entries[j].RelPath
++	})
++	// 原地重排后必须重建下标，否则 bySource/byRelPath 仍指向旧位置，
++	// 多相册分边界提交后会让 SkipDecision/Upsert 命中错误条目（审查 F1）。
++	l.rebuildIndex()
++	l.UpdatedAt = time.Now()
++	if l.CreatedAt.IsZero() {
++		l.CreatedAt = l.UpdatedAt
++	}
++
++	data, err := json.MarshalIndent(l, "", "  ")
++	if err != nil {
++		return err
++	}
++
++	dir := filepath.Join(l.root, integrityDirName)
++	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
++		return err
++	}
++	current := filepath.Join(dir, ledgerFileName)
++	if err := atomicWriteFile(current, data); err != nil {
++		return err
++	}
++	// ledger.bak 只做锦上添花的最近完好副本：写失败不影响本次提交（current 已完整切换）。
++	backup := filepath.Join(dir, ledgerBackupFileName)
++	if err := atomicWriteFile(backup, data); err != nil {
++		return nil //nolint:nilerr // 见注释
++	}
++	return nil
++}
++
++// ErrLedgerMissing 表示域根下没有账本文件。
++var ErrLedgerMissing = errors.New("ledger file not found")
++
++// ErrLedgerCorrupt 表示 ledger.json 与 ledger.bak 都无法解析，调用方必须中止而不是静默重建。
++var ErrLedgerCorrupt = errors.New("ledger is corrupt: ledger.json and ledger.bak both unparseable")
++
++// LoadLedger 读取域根账本；ledger.json 损坏时自动回退 ledger.bak。
++// 账本不存在返回 ErrLedgerMissing；两份都损坏返回 ErrLedgerCorrupt。
++func LoadLedger(root string) (*Ledger, error) {
++	current := LedgerPath(root)
++	l, err := loadLedgerFile(current)
++	if err == nil {
++		l.root = root
++		return l, nil
++	}
++	if errors.Is(err, os.ErrNotExist) {
++		// 当前账本不存在：若只有 bak（极端情况下 rename 后崩溃），也允许恢复。
++		backup := filepath.Join(root, integrityDirName, ledgerBackupFileName)
++		l, bakErr := loadLedgerFile(backup)
++		if bakErr != nil {
++			return nil, ErrLedgerMissing
++		}
++		l.root = root
++		return l, nil
++	}
++
++	// ledger.json 存在但解析失败：回退最近完好副本。
++	backup := filepath.Join(root, integrityDirName, ledgerBackupFileName)
++	l, bakErr := loadLedgerFile(backup)
++	if bakErr != nil {
++		return nil, fmt.Errorf("%w: %v", ErrLedgerCorrupt, err)
++	}
++	l.root = root
++	return l, nil
++}
++
++func loadLedgerFile(path string) (*Ledger, error) {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	var l Ledger
++	if err := json.Unmarshal(data, &l); err != nil {
++		return nil, err
++	}
++	if len(l.Entries) == 0 {
++		l.Entries = nil
++	}
++	l.rebuildIndex()
++	return &l, nil
++}
++
++// atomicWriteFile 在同目录写临时文件、Sync 后原子 rename 覆盖目标，
++// 保证崩溃时目标要么是旧完整内容、要么是新完整内容，绝不出现半截 JSON。
++func atomicWriteFile(path string, data []byte) error {
++	dir := filepath.Dir(path)
++	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
++		return err
++	}
++	tmp := path + ".tmp"
++	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
++	if err != nil {
++		return err
++	}
++	closed := false
++	defer func() {
++		if !closed {
++			_ = f.Close()
++			_ = os.Remove(tmp)
++		}
++	}()
++
++	if _, err := f.Write(data); err != nil {
++		return err
++	}
++	if err := f.Sync(); err != nil {
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	closed = true
++	return os.Rename(tmp, path)
++}
++
++// DiscoverLedgerRoots 扫描 storage/qzone 下全部四类备份域根。
++func DiscoverLedgerRoots() []LedgerDomain {
++	return discoverLedgerRoots("storage")
++}
++
++func discoverLedgerRoots(base string) []LedgerDomain {
++	var domains []LedgerDomain
++
++	// 个人相册：storage/qzone/<QQ>/album
++	albumRoots, _ := filepath.Glob(filepath.Join(base, "qzone", "*", "album"))
++	for _, root := range albumRoots {
++		if !util.IsDir(root) {
++			continue
++		}
++		ownerUin := filepath.Base(filepath.Dir(root))
++		domains = append(domains, describeDomain(LedgerKindAlbum, root, ownerUin, ""))
++	}
++
++	// 群相册：storage/qzone/<登录QQ>/qun/<群号>
++	groupRoots, _ := filepath.Glob(filepath.Join(base, "qzone", "*", "qun", "*"))
++	for _, root := range groupRoots {
++		if !util.IsDir(root) {
++			continue
++		}
++		groupID := filepath.Base(root)
++		ownerUin := filepath.Base(filepath.Dir(filepath.Dir(root)))
++		domains = append(domains, describeDomain(LedgerKindGroupAlbum, root, ownerUin, groupID))
++	}
++
++	// 说说
++	moodRoots, _ := filepath.Glob(filepath.Join(base, "qzone", "*", moodDirName))
++	for _, root := range moodRoots {
++		if !util.IsDir(root) {
++			continue
++		}
++		ownerUin := filepath.Base(filepath.Dir(root))
++		domains = append(domains, describeDomain(LedgerKindShuoshuo, root, ownerUin, ""))
++	}
++
++	// 留言板
++	boardRoots, _ := filepath.Glob(filepath.Join(base, "qzone", "*", boardDirName))
++	for _, root := range boardRoots {
++		if !util.IsDir(root) {
++			continue
++		}
++		ownerUin := filepath.Base(filepath.Dir(root))
++		domains = append(domains, describeDomain(LedgerKindBoard, root, ownerUin, ""))
++	}
++
++	sort.SliceStable(domains, func(i, j int) bool {
++		if domains[i].Kind != domains[j].Kind {
++			return domains[i].Kind < domains[j].Kind
++		}
++		if domains[i].OwnerUin != domains[j].OwnerUin {
++			return domains[i].OwnerUin < domains[j].OwnerUin
++		}
++		return domains[i].GroupID < domains[j].GroupID
++	})
++	return domains
++}
++
++// describeDomain 读取单个域根的账本状态（有无/条目数/损坏），读失败只做状态标记不抛错。
++func describeDomain(kind LedgerKind, root, ownerUin, groupID string) LedgerDomain {
++	d := LedgerDomain{Kind: kind, Root: root, OwnerUin: ownerUin, GroupID: groupID}
++	if _, err := os.Stat(LedgerPath(root)); err == nil {
++		d.HasLedger = true
++		if l, loadErr := LoadLedger(root); loadErr == nil {
++			d.EntryCount = l.Count()
++		} else if errors.Is(loadErr, ErrLedgerCorrupt) {
++			d.Corrupt = true
++		}
++	}
++	return d
++}
+diff --git a/internal/app/ledger_test.go b/internal/app/ledger_test.go
+new file mode 100644
+index 0000000..c0c3675
+--- /dev/null
++++ b/internal/app/ledger_test.go
+@@ -0,0 +1,349 @@
++// 完整性账本的模型、原子存储、身份构造与域根发现测试（全程本地，无网络）。
++
++package app
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++)
++
++// writeMedia 在 root/rel 写入内容，返回其 size 与 sha256。
++func writeMedia(t *testing.T, root, rel, content string) (int64, string) {
++	t.Helper()
++	p := filepath.Join(root, filepath.FromSlash(rel))
++	if err := os.MkdirAll(filepath.Dir(p), os.ModePerm); err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
++		t.Fatalf("write media: %v", err)
++	}
++	size, sum, err := util.FileDigest(p)
++	if err != nil {
++		t.Fatalf("digest: %v", err)
++	}
++	return size, sum
++}
++
++func TestLedgerSourceIDFormats(t *testing.T) {
++	cases := []struct {
++		got, want string
++	}{
++		{AlbumSourceID("10001", "albumid-9", "sloc-xyz"), "album:10001:albumid-9:sloc-xyz"},
++		{GroupSourceID("10001", "555群", "aid", "sl"), "group:10001:555群:aid:sl"},
++		{ShuoshuoSourceID("10001", "tid1", "pic2", ""), "shuoshuo:10001:tid1:pic2"},
++		{BoardSourceID("10001", "tid1", "pic2", ""), "board:10001:tid1:pic2"},
++		{ShuoshuoSourceID("10001", "tid1", "", "http://x/y"), "shuoshuo:10001:tid1:url:" + util.MD5("http://x/y")},
++		{LocalSourceID("a/b/c.jpg"), "local:a/b/c.jpg"},
++	}
++	for _, c := range cases {
++		if c.got != c.want {
++			t.Fatalf("source id = %q, want %q", c.got, c.want)
++		}
++	}
++	if !IsLocalSource("local:a/b.jpg") || IsLocalSource("album:1:2:3") {
++		t.Fatal("IsLocalSource 判断错误")
++	}
++}
++
++func TestMediaKindFromExt(t *testing.T) {
++	cases := map[string]string{
++		"a.jpg": MediaKindImage, "A.PNG": MediaKindImage, "v.mp4": MediaKindVideo,
++		"a.mp3": MediaKindVoice, "x.bin": MediaKindOther,
++	}
++	for name, want := range cases {
++		if got := MediaKindFromExt(name); got != want {
++			t.Fatalf("%s -> %s, want %s", name, got, want)
++		}
++	}
++}
++
++func TestLedgerUpsertAndReplaceBaseline(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++
++	size, sum := writeMedia(t, root, "相册/2021/03/IMG_x.jpg", "hello")
++	base := LedgerEntry{
++		SourceID: LocalSourceID("相册/2021/03/IMG_x.jpg"), MediaKind: MediaKindImage,
++		RelPath: "相册/2021/03/IMG_x.jpg", Size: size, SHA256: sum, OriginVerified: false,
++	}
++	l.Upsert(base)
++	if l.Count() != 1 {
++		t.Fatalf("baseline entries = %d", l.Count())
++	}
++
++	// 同一 source 重复 upsert：去重且保留 CreatedAt。
++	firstCreated := l.Entries[0].CreatedAt
++	time.Sleep(2 * time.Millisecond)
++	l.Upsert(base)
++	if l.Count() != 1 {
++		t.Fatalf("upsert 应按 source 去重，实际 %d", l.Count())
++	}
++	if !l.Entries[0].CreatedAt.Equal(firstCreated) {
++		t.Fatal("重复 upsert 不应覆盖 CreatedAt")
++	}
++
++	// 同 rel_path 的已验证在线条目接管：local 条目被替换。
++	verified := LedgerEntry{
++		SourceID: AlbumSourceID("10001", "aid", "sloc1"), MediaKind: MediaKindImage,
++		RelPath: "相册/2021/03/IMG_x.jpg", Size: size, SHA256: sum, OriginVerified: true,
++	}
++	l.Upsert(verified)
++	if l.Count() != 1 {
++		t.Fatalf("在线条目应替换同路径 local 条目，实际 %d", l.Count())
++	}
++	got, ok := l.FindByRelPath("相册/2021/03/IMG_x.jpg")
++	if !ok || !got.OriginVerified || got.SourceID != verified.SourceID {
++		t.Fatalf("同路径替换错误: %+v ok=%v", got, ok)
++	}
++}
++
++// 同一来源条目改 rel（扩展名变更）后，旧 rel 键必须立即失效（R2 advisory A1）。
++func TestLedgerUpsertSourceRenameDropsOldRelIndex(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++	id := AlbumSourceID("10001", "a1", "sloc1")
++	l.Upsert(LedgerEntry{SourceID: id, RelPath: "A/a.jpg", SHA256: "x"})
++	l.Upsert(LedgerEntry{SourceID: id, RelPath: "A/a.png", SHA256: "y", OriginVerified: true})
++
++	if _, ok := l.FindByRelPath("A/a.jpg"); ok {
++		t.Fatal("旧 rel 键不应残留")
++	}
++	e, ok := l.FindByRelPath("A/a.png")
++	if !ok || e.SourceID != id {
++		t.Fatalf("新 rel 键应指向同一条目: %+v ok=%v", e, ok)
++	}
++	if l.Count() != 1 {
++		t.Fatalf("同来源仍只应有 1 条，实际 %d", l.Count())
++	}
++	if got := l.SkipDecision(id); got != LedgerSkipMismatch {
++		t.Fatal("改名后磁盘无新文件，决策应为 mismatch（实际文件未放置）")
++	}
++}
++
++func TestLedgerRemoveByRelPathPrefix(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++	l.Upsert(LedgerEntry{SourceID: "album:1:a:1", RelPath: "A/x.jpg", SHA256: "1"})
++	l.Upsert(LedgerEntry{SourceID: "album:1:a:2", RelPath: "A/y.jpg", SHA256: "2"})
++	l.Upsert(LedgerEntry{SourceID: "album:1:b:1", RelPath: "B/z.jpg", SHA256: "3"})
++
++	if n := l.RemoveByRelPathPrefix("A/"); n != 2 {
++		t.Fatalf("删除 A/ 前缀条目数 = %d, want 2", n)
++	}
++	if l.Count() != 1 {
++		t.Fatalf("剩余条目 = %d, want 1", l.Count())
++	}
++	if _, ok := l.FindBySource("album:1:b:1"); !ok {
++		t.Fatal("B 相册条目应保留")
++	}
++}
++
++func TestLedgerAtomicSaveLoadRoundTrip(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindShuoshuo, "10001", "", root)
++	size, sum := writeMedia(t, root, "media/2021/03/a.jpg", "abc")
++	l.Upsert(LedgerEntry{
++		SourceID: ShuoshuoSourceID("10001", "tid", "mid", ""),
++		RelPath:  "media/2021/03/a.jpg", Size: size, SHA256: sum,
++		OriginVerified: true, MediaKind: MediaKindImage,
++	})
++	if err := l.Save(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++
++	entries, err := os.ReadDir(filepath.Join(root, integrityDirName))
++	if err != nil {
++		t.Fatalf("read integrity dir: %v", err)
++	}
++	for _, e := range entries {
++		if strings.HasSuffix(e.Name(), ".tmp") {
++			t.Fatalf("原子写完成后不应残留临时文件: %s", e.Name())
++		}
++	}
++
++	got, err := LoadLedger(root)
++	if err != nil {
++		t.Fatalf("load: %v", err)
++	}
++	if got.Kind != LedgerKindShuoshuo || got.HashAlg != ledgerHashAlg || got.Count() != 1 {
++		t.Fatalf("重新加载内容不符: %+v", got)
++	}
++	if got.Entries[0].SHA256 != sum || got.Entries[0].Size != size {
++		t.Fatal("条目 size/sha256 往返不一致")
++	}
++}
++
++func TestLoadLedgerMissing(t *testing.T) {
++	if _, err := LoadLedger(t.TempDir()); err != ErrLedgerMissing {
++		t.Fatalf("无账本应返回 ErrLedgerMissing，实际 %v", err)
++	}
++}
++
++func TestLoadLedgerFallbackToBackup(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindBoard, "10001", "", root)
++	l.Upsert(LedgerEntry{SourceID: BoardSourceID("10001", "t", "m", ""), RelPath: "media/a.jpg", SHA256: "aa"})
++	if err := l.Save(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	// 写坏 ledger.json，bak 仍应可解析。
++	if err := os.WriteFile(LedgerPath(root), []byte("{broken json"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	got, err := LoadLedger(root)
++	if err != nil {
++		t.Fatalf("损坏 ledger.json 应回退 bak: %v", err)
++	}
++	if got.Count() != 1 || got.Entries[0].SHA256 != "aa" {
++		t.Fatalf("回退内容错误: %+v", got)
++	}
++}
++
++func TestLoadLedgerBothCorrupt(t *testing.T) {
++	root := t.TempDir()
++	dir := filepath.Join(root, integrityDirName)
++	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, ledgerFileName), []byte("{x"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, ledgerBackupFileName), []byte("}y"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := LoadLedger(root); !errors.Is(err, ErrLedgerCorrupt) {
++		t.Fatalf("双损坏应返回 ErrLedgerCorrupt，实际 %v", err)
++	}
++}
++
++func TestDiscoverLedgerRoots(t *testing.T) {
++	tmp := t.TempDir()
++	t.Chdir(tmp)
++
++	// 四类域根各建一个。
++	dirs := []string{
++		AlbumLedgerRoot("10001"),
++		GroupLedgerRoot("10001", "90001"),
++		ShuoshuoLedgerRoot("10001"),
++		BoardLedgerRoot("10002"),
++	}
++	for _, d := range dirs {
++		if err := os.MkdirAll(d, os.ModePerm); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// 给群相册写一本账，验证状态描述。
++	gl := NewLedger(LedgerKindGroupAlbum, "10001", "90001", GroupLedgerRoot("10001", "90001"))
++	gl.Upsert(LedgerEntry{SourceID: "group:10001:90001:a:s", RelPath: "相册A/x.jpg", SHA256: "z"})
++	if err := gl.Save(); err != nil {
++		t.Fatal(err)
++	}
++	// 损坏账本：无 bak 且 json 坏掉 → Corrupt。
++	badRoot := AlbumLedgerRoot("10003")
++	_ = os.MkdirAll(filepath.Join(badRoot, integrityDirName), os.ModePerm)
++	_ = os.WriteFile(LedgerPath(badRoot), []byte("{"), 0644)
++
++	domains := discoverLedgerRoots("storage")
++	seen := map[LedgerKind]int{}
++	var groupDomain, badDomain *LedgerDomain
++	for i := range domains {
++		d := &domains[i]
++		seen[d.Kind]++
++		if d.Kind == LedgerKindGroupAlbum {
++			groupDomain = d
++		}
++		if d.OwnerUin == "10003" {
++			badDomain = d
++		}
++	}
++	if seen[LedgerKindAlbum] != 2 || seen[LedgerKindGroupAlbum] != 1 ||
++		seen[LedgerKindShuoshuo] != 1 || seen[LedgerKindBoard] != 1 {
++		t.Fatalf("域根发现数量错误: %+v", seen)
++	}
++	if groupDomain == nil || !groupDomain.HasLedger || groupDomain.EntryCount != 1 || groupDomain.GroupID != "90001" {
++		t.Fatalf("群域根状态错误: %+v", groupDomain)
++	}
++	if badDomain == nil || !badDomain.HasLedger || !badDomain.Corrupt {
++		t.Fatalf("损坏域根状态错误: %+v", badDomain)
++	}
++}
++
++// TestLedgerSaveKeepsIndexesValidAcrossAlbums 回归审查 F1：
++// 跨相册乱序条目 Save（原地排序）后，内存下标必须仍指向各自条目，
++// 后续相册的 SkipDecision/Upsert 不得串号或误删他相册健康条目。
++func TestLedgerSaveKeepsIndexesValidAcrossAlbums(t *testing.T) {
++	root := t.TempDir()
++	a0 := AlbumSourceID("10001", "A", "a0")
++	a1 := AlbumSourceID("10001", "A", "a1")
++	b0 := AlbumSourceID("10001", "B", "b0")
++	b1 := AlbumSourceID("10001", "B", "b1")
++
++	// 故意乱序插入（实际下载完成顺序 ≠ 落盘排序顺序）。
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++	l.Upsert(LedgerEntry{SourceID: b1, RelPath: "B/b1.jpg", SHA256: "b1"})
++	l.Upsert(LedgerEntry{SourceID: a0, RelPath: "A/a0.jpg", SHA256: "a0"})
++	l.Upsert(LedgerEntry{SourceID: b0, RelPath: "B/b0.jpg", SHA256: "b0"})
++	l.Upsert(LedgerEntry{SourceID: a1, RelPath: "A/a1.jpg", SHA256: "a1"})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++
++	// 排序后 FindBySource/RelPath 必须各归各位。
++	for _, want := range []struct{ sid, rel string }{
++		{a0, "A/a0.jpg"}, {a1, "A/a1.jpg"}, {b0, "B/b0.jpg"}, {b1, "B/b1.jpg"},
++	} {
++		e, ok := l.FindBySource(want.sid)
++		if !ok || e.RelPath != want.rel {
++			t.Fatalf("Save 后下标串号: source %s -> %+v ok=%v", want.sid, e, ok)
++		}
++		if e2, ok := l.FindByRelPath(want.rel); !ok || e2.SourceID != want.sid {
++			t.Fatalf("Save 后 rel 下标串号: %s -> %+v ok=%v", want.rel, e2, ok)
++		}
++	}
++
++	// 模拟二次备份：B0 文件被删（缺失），A 相册新完成 A2 并再次提交。
++	l.Upsert(LedgerEntry{SourceID: AlbumSourceID("10001", "A", "a2"), RelPath: "A/a2.jpg", SHA256: "a2", OriginVerified: true})
++	if err := l.Save(); err != nil {
++		t.Fatal(err)
++	}
++	if got := l.SkipDecision(b0); got != LedgerSkipMismatch {
++		t.Fatalf("B0 文件缺失必须 mismatch（审查 F1 场景），实际 %d", got)
++	}
++	// B 的两条健康条目仍在账本中。
++	if _, ok := l.FindBySource(b0); !ok {
++		t.Fatal("B0 条目不得被 A2 的 Upsert 误删")
++	}
++	if _, ok := l.FindBySource(b1); !ok {
++		t.Fatal("B1 条目不得被 A2 的 Upsert 误删")
++	}
++	if l.Count() != 5 {
++		t.Fatalf("条目数 = %d, want 5", l.Count())
++	}
++}
++
++func TestEntryFromFile(t *testing.T) {
++	root := t.TempDir()
++	content := "integrity-content"
++	size, sum := writeMedia(t, root, "album名/2022/01/v.mp4", content)
++
++	e, err := EntryFromFile(root, "album名/2022/01/v.mp4", AlbumSourceID("1", "2", "3"), true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if e.Size != size || e.SHA256 != sum || !e.OriginVerified || e.MediaKind != MediaKindVideo {
++		t.Fatalf("条目构造错误: %+v", e)
++	}
++	want := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
++	if e.SHA256 != want || hex.EncodedLen(32) != len(want) {
++		t.Fatalf("sha256 = %s, want %s", e.SHA256, want)
++	}
++}
+diff --git a/internal/app/media_ledger_glue.go b/internal/app/media_ledger_glue.go
+new file mode 100644
+index 0000000..1ec4bee
+--- /dev/null
++++ b/internal/app/media_ledger_glue.go
+@@ -0,0 +1,106 @@
++// 说说与留言板共用的完整性账本会话：打开账本、来源身份、跳过决策、完成条目暂存与原子提交。
++// 两条备份链路对媒体的处理口径必须一致，统一收敛在这里，避免各写一套。
++
++package app
++
++import (
++	"errors"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	"go.uber.org/zap"
++)
++
++// mediaLedgerSession 挂载在 MoodBackup / BoardBackup 上，语义与 Spider 的 staged 提交相同。
++type mediaLedgerSession struct {
++	mu     sync.Mutex
++	ledger *Ledger
++	root   string // 域根（shuoshuo / liuyanban）
++	prefix string // sourcePrefixShuo 或 sourcePrefixBoard
++	uin    string // 被备份空间 QQ
++	staged []LedgerEntry
++}
++
++// init 打开域根账本；不存在则新建内存账本，双损坏时返回错误中止任务。
++func (s *mediaLedgerSession) init(kind LedgerKind, prefix, uin, root string) error {
++	l, err := LoadLedger(root)
++	if errors.Is(err, ErrLedgerMissing) {
++		l = NewLedger(kind, uin, "", root)
++		err = nil
++	}
++	if err != nil {
++		return err
++	}
++	s.mu.Lock()
++	s.ledger = l
++	s.root = root
++	s.prefix = prefix
++	s.uin = uin
++	s.staged = nil
++	s.mu.Unlock()
++	return nil
++}
++
++// sourceID 按条目 tid + 媒体身份生成稳定来源 ID。
++func (s *mediaLedgerSession) sourceID(tid string, m *MoodMedia) string {
++	if m == nil {
++		return ""
++	}
++	return MoodMediaSourceID(s.prefix, s.uin, tid, m.ID, m.URL)
++}
++
++// decisionFor 按完整来源要素做跳过决策（失败项上只有 id/url、内存里没有 MoodMedia 时用）。
++func (s *mediaLedgerSession) decisionFor(tid, mediaID, mediaURL string) LedgerSkipDecision {
++	if s == nil || s.ledger == nil {
++		return LedgerSkipNoEntry
++	}
++	id := MoodMediaSourceID(s.prefix, s.uin, tid, mediaID, mediaURL)
++	return s.ledger.SkipDecision(id)
++}
++
++// decision 对一个内存中的媒体做跳过决策。
++func (s *mediaLedgerSession) decision(tid string, m *MoodMedia) LedgerSkipDecision {
++	if m == nil {
++		return LedgerSkipNoEntry
++	}
++	return s.decisionFor(tid, m.ID, m.URL)
++}
++
++// stage 对刚成功下载（非跳过）的媒体计算摘要并暂存；调用时媒体 Path 已是最终相对路径。
++func (s *mediaLedgerSession) stage(tid string, m *MoodMedia) {
++	if s == nil || s.ledger == nil || m == nil || m.Path == "" {
++		return
++	}
++	rel := filepath.ToSlash(m.Path)
++	if rel == "." || strings.HasPrefix(rel, "..") {
++		return
++	}
++	entry, err := EntryFromFile(s.root, rel, s.sourceID(tid, m), true)
++	if err != nil {
++		return
++	}
++	s.mu.Lock()
++	s.staged = append(s.staged, entry)
++	s.mu.Unlock()
++}
++
++// commit 在整次备份/重试正常结束时原子提交；clean=false（取消）丢弃暂存、保留旧账本。
++func (s *mediaLedgerSession) commit(clean bool, logger *zap.SugaredLogger) {
++	if s == nil || s.ledger == nil {
++		return
++	}
++	s.mu.Lock()
++	staged := s.staged
++	s.staged = nil
++	s.mu.Unlock()
++	if !clean {
++		return
++	}
++	for _, e := range staged {
++		s.ledger.Upsert(e)
++	}
++	if err := s.ledger.Save(); err != nil && logger != nil {
++		logger.Warnf("⚠️ 完整性账本提交失败（不影响已下载文件；这些文件在下次被重新在线下载时会补登记，也可在完整性核验后纳入本地基线）: %v", err)
++	}
++}
+diff --git a/internal/app/media_ledger_glue_test.go b/internal/app/media_ledger_glue_test.go
+new file mode 100644
+index 0000000..d1d020c
+--- /dev/null
++++ b/internal/app/media_ledger_glue_test.go
+@@ -0,0 +1,156 @@
++// 说说/留言板账本会话的本地测试：身份、跳过决策、暂存提交与取消语义；
++// 以及 downloadOneMedia 在「已有文件」分支上无需网络的跳过行为。
++
++package app
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/qinjintian/qq-zone/internal/pkg/util"
++	"go.uber.org/zap"
++)
++
++func initMediaSession(t *testing.T, kind LedgerKind, prefix, uin string) (*mediaLedgerSession, string) {
++	t.Helper()
++	root := t.TempDir()
++	s := &mediaLedgerSession{}
++	if err := s.init(kind, prefix, uin, root); err != nil {
++		t.Fatalf("init session: %v", err)
++	}
++	return s, root
++}
++
++func TestMediaLedgerSessionIdentityFallback(t *testing.T) {
++	s, _ := initMediaSession(t, LedgerKindShuoshuo, sourcePrefixShuo, "10001")
++	m := &MoodMedia{ID: "pic9", URL: "http://x/1"}
++	if got := s.sourceID("tid1", m); got != "shuoshuo:10001:tid1:pic9" {
++		t.Fatalf("媒体 ID 身份错误: %s", got)
++	}
++	m2 := &MoodMedia{ID: "", URL: "http://x/2"}
++	want := "shuoshuo:10001:tid1:url:" + util.MD5("http://x/2")
++	if got := s.sourceID("tid1", m2); got != want {
++		t.Fatalf("URL 兜底身份错误: %s, want %s", got, want)
++	}
++}
++
++func TestMediaLedgerSessionDecisionAndStage(t *testing.T) {
++	s, root := initMediaSession(t, LedgerKindShuoshuo, sourcePrefixShuo, "10001")
++	rel := "media/2021/03/IMG_a.jpg"
++	size, sum := writeMedia(t, root, rel, "mood-pic")
++	m := &MoodMedia{ID: "mid1", URL: "http://x/a", Type: "image", Path: rel}
++	sid := s.sourceID("tid1", m)
++	s.ledger.Upsert(LedgerEntry{SourceID: sid, RelPath: rel, Size: size, SHA256: sum, OriginVerified: true, MediaKind: MediaKindImage})
++
++	if d := s.decision("tid1", m); d != LedgerSkipHealthy {
++		t.Fatalf("一致应 healthy，实际 %d", d)
++	}
++	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), []byte("changed!"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if d := s.decision("tid1", m); d != LedgerSkipMismatch {
++		t.Fatalf("改动应 mismatch，实际 %d", d)
++	}
++	if d := s.decision("tid-other", &MoodMedia{ID: "x", URL: "u"}); d != LedgerSkipNoEntry {
++		t.Fatalf("无身份应 noEntry，实际 %d", d)
++	}
++
++	// 恢复内容后 stage + commit。
++	writeMedia(t, root, rel, "mood-pic")
++	voiceRel := "media/2021/04/AUD_v.mp3"
++	writeMedia(t, root, voiceRel, "voice-bytes")
++	mv := &MoodMedia{ID: "vid", URL: "http://x/v", Type: "voice", Path: voiceRel}
++	s.stage("tid1", m)
++	s.stage("tid2", mv)
++	s.commit(true, zap.NewNop().Sugar())
++
++	l, err := LoadLedger(root)
++	if err != nil || l.Count() != 2 {
++		t.Fatalf("提交后条目数错误: %v err=%v", l, err)
++	}
++	if e, ok := l.FindBySource(s.sourceID("tid2", mv)); !ok || !e.OriginVerified || e.MediaKind != MediaKindVoice || e.RelPath != voiceRel {
++		t.Fatalf("语音条目错误: %+v", e)
++	}
++}
++
++func TestMediaLedgerSessionCancelDiscardsStaged(t *testing.T) {
++	s, root := initMediaSession(t, LedgerKindBoard, sourcePrefixBoard, "10001")
++	rel := "media/2021/03/a.jpg"
++	writeMedia(t, root, rel, "board")
++	s.ledger.Upsert(LedgerEntry{SourceID: "board:10001:old:1", RelPath: "media/old.jpg", SHA256: "z"})
++	if err := s.ledger.Save(); err != nil {
++		t.Fatal(err)
++	}
++	before, _ := os.ReadFile(LedgerPath(root))
++
++	s.stage("tid", &MoodMedia{ID: "m", URL: "u", Path: rel})
++	s.commit(false, zap.NewNop().Sugar()) // 取消
++
++	after, _ := os.ReadFile(LedgerPath(root))
++	if string(before) != string(after) {
++		t.Fatal("取消提交必须保留旧账本字节")
++	}
++	l, _ := LoadLedger(root)
++	if l.Count() != 1 {
++		t.Fatalf("取消后不应有新条目，实际 %d", l.Count())
++	}
++
++	// 域外路径拒绝暂存。
++	s.stage("tid", &MoodMedia{ID: "m2", URL: "u", Path: "../escape.jpg"})
++	s.commit(true, zap.NewNop().Sugar())
++	l, _ = LoadLedger(root)
++	if l.Count() != 1 {
++		t.Fatalf("域外路径不得登记，实际 %d", l.Count())
++	}
++}
++
++func TestMoodDownloadOneMediaLedgerSkipBranches(t *testing.T) {
++	root := t.TempDir()
++	b := &MoodBackup{logger: zap.NewNop().Sugar()}
++	if err := b.ledger.init(LedgerKindShuoshuo, sourcePrefixShuo, "10001", root); err != nil {
++		t.Fatal(err)
++	}
++	rel := "media/2022/01/IMG_1.jpg"
++	size, sum := writeMedia(t, root, rel, "pic")
++	m := &MoodMedia{ID: "mid", URL: "http://x/1", Type: "image", Path: rel}
++	posts := []MoodPost{{TID: "tid1", Media: []MoodMedia{*m}}}
++	mm := &posts[0].Media[0]
++
++	// 无条目：沿用旧「非空即跳过」，不得触网（client 为 nil，走到网络必然 panic），且不登记。
++	b.downloadOneMedia(context.Background(), root, "10001", posts, 0, mm)
++	if b.ledger.ledger.Count() != 0 {
++		t.Fatal("旧行为跳过不应写账本")
++	}
++	if b.results.ImageCount != 1 {
++		t.Fatalf("无条目跳过应计入图片成功数，实际 %d", b.results.ImageCount)
++	}
++
++	// 写入一致账本条目：仍离线跳过（同样不触网）。
++	b.ledger.ledger.Upsert(LedgerEntry{
++		SourceID: b.ledger.sourceID("tid1", mm), RelPath: rel, Size: size, SHA256: sum,
++		OriginVerified: true, MediaKind: MediaKindImage,
++	})
++	b.downloadOneMedia(context.Background(), root, "10001", posts, 0, mm)
++	if b.results.ImageCount != 2 {
++		t.Fatalf("账本一致应离线跳过，ImageCount=%d", b.results.ImageCount)
++	}
++}
++
++func TestBoardDownloadOneMediaLegacySkipNoNetwork(t *testing.T) {
++	root := t.TempDir()
++	b := &BoardBackup{logger: zap.NewNop().Sugar()}
++	if err := b.ledger.init(LedgerKindBoard, sourcePrefixBoard, "10001", root); err != nil {
++		t.Fatal(err)
++	}
++	rel := "media/2022/01/IMG_b.jpg"
++	writeMedia(t, root, rel, "board-pic")
++	m := &MoodMedia{ID: "mid", URL: "https://x/1.jpg", Type: "image", Path: rel}
++	posts := []MoodPost{{TID: "tid1", Media: []MoodMedia{*m}}}
++	// 无账本条目 + 非空文件：旧行为直接跳过（client 为 nil，若触网即 panic）。
++	b.downloadOneMedia(context.Background(), root, "10001", posts, 0, &posts[0].Media[0])
++	if b.ledger.ledger.Count() != 0 || b.results.ImageCount != 1 {
++		t.Fatalf("留言板旧跳过行为异常: 条目=%d image=%d", b.ledger.ledger.Count(), b.results.ImageCount)
++	}
++}
+diff --git a/internal/app/mood_backup.go b/internal/app/mood_backup.go
+index 2477586..73acd68 100644
+--- a/internal/app/mood_backup.go
++++ b/internal/app/mood_backup.go
+@@ -33,6 +33,8 @@ type MoodBackup struct {
+ 	archived  bool   // 列表接口提示更早说说被封存时为 true
+ 	notice    string // 封存提示文案，写入 backup.json 给查看页顶部展示
+ 	spaceName string // 被备份空间的昵称，查看页标题用
++
++	ledger mediaLedgerSession // 说说媒体完整性账本会话
+ }
+ 
+ // NewMoodBackup 创建说说备份任务。
+@@ -53,6 +55,11 @@ func (b *MoodBackup) Backup(ctx context.Context, targetUin string, exclude bool)
+ 		return nil, err
+ 	}
+ 
++	// 打开说说域根完整性账本；双损坏时中止，不允许用空账本覆盖。
++	if err := b.ledger.init(LedgerKindShuoshuo, sourcePrefixShuo, targetUin, root); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
++
+ 	existing, _ := loadMoodBackup(root)
+ 	known := map[string]MoodPost{}
+ 	if existing != nil {
+@@ -159,6 +166,9 @@ func (b *MoodBackup) Backup(ctx context.Context, targetUin string, exclude bool)
+ 		return &b.results, fmt.Errorf("生成查看页失败: %w", err)
+ 	}
+ 
++	// 账本只在整次备份正常走完（backup.json/查看页都已写好）后提交一次；取消则保留旧版。
++	b.ledger.commit(ctx.Err() == nil, b.logger)
++
+ 	success := uint64(len(posts))
+ 	if b.results.Failed > uint64(len(posts)) {
+ 		success = 0
+@@ -175,6 +185,9 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
+ 	if err != nil {
+ 		return nil, fmt.Errorf("读取已有说说备份失败: %w", err)
+ 	}
++	if err := b.ledger.init(LedgerKindShuoshuo, sourcePrefixShuo, targetUin, root); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
+ 
+ 	byTID := map[string]*MoodPost{}
+ 	for i := range file.Posts {
+@@ -201,6 +214,7 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
+ 		case <-ctx.Done():
+ 			bar.Abort(true)
+ 			p.Wait()
++			b.ledger.commit(false, b.logger)
+ 			return &b.results, ctx.Err()
+ 		default:
+ 		}
+@@ -243,10 +257,19 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
+ 		dest := filepath.Join(root, filepath.FromSlash(rel))
+ 		if util.Exists(dest) {
+ 			if fi, statErr := os.Stat(dest); statErr == nil && fi.Size() > 0 {
+-				atomic.AddUint64(&b.results.Success, 1)
+-				atomic.AddUint64(&b.results.Skipped, 1)
+-				bar.Increment()
+-				continue
++				// 已有非空文件：先问账本。一致才离线跳过；不一致必须重下；无条目沿用旧行为但不登记。
++				decision := LedgerSkipNoEntry
++				if media != nil {
++					decision = b.ledger.decision(tid, media)
++				} else {
++					decision = b.ledger.decisionFor(tid, item.MediaID, item.MediaURL)
++				}
++				if decision != LedgerSkipMismatch {
++					atomic.AddUint64(&b.results.Success, 1)
++					atomic.AddUint64(&b.results.Skipped, 1)
++					bar.Increment()
++					continue
++				}
+ 			}
+ 		}
+ 
+@@ -265,6 +288,26 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
+ 				}
+ 			}
+ 		}
++		// 重试补回的文件同样要登记；media 树缺失时用失败项要素兜底构造身份。
++		if media != nil {
++			b.ledger.stage(tid, media)
++		} else {
++			fallback := MoodMedia{ID: item.MediaID, URL: item.MediaURL}
++			if isVideo {
++				fallback.Type = "video"
++			}
++			if res != nil {
++				if path, ok := res["path"].(string); ok {
++					if relPath, relErr := filepath.Rel(root, path); relErr == nil {
++						fallback.Path = filepath.ToSlash(relPath)
++					}
++				}
++			}
++			if fallback.Path == "" {
++				fallback.Path = rel
++			}
++			b.ledger.stage(tid, &fallback)
++		}
+ 		b.noteMediaSuccess(isVideo)
+ 		atomic.AddUint64(&b.results.Success, 1)
+ 		bar.Increment()
+@@ -280,6 +323,7 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
+ 	if err := writeMoodViewer(root, file); err != nil {
+ 		return &b.results, err
+ 	}
++	b.ledger.commit(ctx.Err() == nil, b.logger)
+ 	return &b.results, nil
+ }
+ 
+@@ -730,8 +774,11 @@ func (b *MoodBackup) downloadOneMedia(ctx context.Context, root, targetUin strin
+ 
+ 	if util.Exists(dest) {
+ 		if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
+-			b.noteMediaSuccess(m.Type == "video")
+-			return
++			// 账本一致才离线跳过；条目不一致（缺失/被改）落下去重新下载；无条目沿用旧行为。
++			if b.ledger.decision(ownerTID, m) != LedgerSkipMismatch {
++				b.noteMediaSuccess(m.Type == "video")
++				return
++			}
+ 		}
+ 	}
+ 
+@@ -764,6 +811,8 @@ func (b *MoodBackup) downloadOneMedia(ctx context.Context, root, targetUin strin
+ 		t := time.Unix(created, 0)
+ 		_ = os.Chtimes(filepath.Join(root, filepath.FromSlash(m.Path)), t, t)
+ 	}
++	// 下载成功（失败已在上面 return）才登记进完整性账本。
++	b.ledger.stage(ownerTID, m)
+ 	b.noteMediaSuccess(m.Type == "video")
+ }
+ 
+diff --git a/internal/app/spider.go b/internal/app/spider.go
+index d2f8d81..2554821 100644
+--- a/internal/app/spider.go
++++ b/internal/app/spider.go
+@@ -90,6 +90,11 @@ type Spider struct {
+ 	debugLines []string        // 回退/失败明细，等当前相册进度条结束后再打印，避免和 mpb 抢终端
+ 	albumStats videoDebugStats // 当前相册内各视频链路的命中次数
+ 	taskStats  videoDebugStats // 整次备份任务的链路命中次数，用于最后一行「全部视频」汇总
++
++	ledger     *Ledger       // 当前任务域根的完整性账本（无账本时为内存新账本，首次提交落盘）
++	ledgerRoot string        // 账本域根路径，staged 条目用它算 rel_path
++	ledgerMu   sync.Mutex    // 保护 staged；账本自身的下标只在提交边界串行访问
++	staged     []LedgerEntry // 已完成文件待提交条目，相册边界或重试结束时原子提交
+ }
+ 
+ // videoDebugStats 统计调试模式下各视频实际走了哪条拉取链路。
+@@ -139,6 +144,11 @@ func (s *Spider) isGroupMode() bool {
+ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (*DownloadResult, error) {
+ 	s.results = DownloadResult{}
+ 
++	// 打开（或首次新建）域根完整性账本；账本双损坏时宁可中止也不允许空账本覆盖。
++	if err := s.initLedger(targetUin); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
++
+ 	p := mpb.NewWithContext(ctx)
+ 	waitName := "正在拉取相册列表"
+ 	if s.isGroupMode() {
+@@ -178,7 +188,8 @@ func (s *Spider) Download(ctx context.Context, targetUin string, exclude bool) (
+ 			s.logger.Debugf("跳过相册 [%s]: 无访问权限 (allowAccess=0)", name)
+ 			continue
+ 		}
+-		if len(s.whitelist) > 0 && !s.whitelist[name] {
++		// 白名单既支持相册名（普通勾选），也支持相册 ID（完整性修复按计划里的相册 ID 限定范围）。
++		if len(s.whitelist) > 0 && !s.whitelist[name] && !s.whitelist[album.Get("id").String()] {
+ 			continue
+ 		}
+ 		filteredAlbums = append(filteredAlbums, album)
+@@ -219,6 +230,11 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems
+ 		return &s.results, nil
+ 	}
+ 
++	// 重试同样要维护账本：成功补回的文件重新登记，取消时不提交半成品状态。
++	if err := s.initLedger(targetUin); err != nil {
++		return nil, fmt.Errorf("完整性账本不可用: %w", err)
++	}
++
+ 	atomic.StoreUint64(&s.results.Total, uint64(len(failedItems)))
+ 	s.resetVideoDebugLogs()
+ 	s.logVideoDebugHint()
+@@ -244,6 +260,7 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems
+ 			p.Wait()
+ 			s.flushVideoDebugLogs()
+ 			s.flushTaskVideoSummary()
++			s.commitStagedLedger(false)
+ 			return &s.results, nil
+ 		default:
+ 		}
+@@ -285,6 +302,7 @@ func (s *Spider) RetryFailed(ctx context.Context, targetUin string, failedItems
+ 	p.Wait()
+ 	s.flushVideoDebugLogs()
+ 	s.flushTaskVideoSummary()
++	s.commitStagedLedger(ctx.Err() == nil)
+ 	return &s.results, nil
+ }
+ 
+@@ -464,6 +482,9 @@ func (s *Spider) downloadAlbum(ctx context.Context, p *mpb.Progress, targetUin s
+ 	// 进度条完成后再打调试日志，避免 Windows 上和 mpb 抢同一块终端。
+ 	s.flushVideoDebugLogs()
+ 	s.flushAlbumVideoSummary(albumName)
++	// 账本提交边界：相册完整跑完（任务未取消）才把本相册成果原子写入；
++	// 非增量模式整个相册目录被重建，旧前缀条目由提交逻辑整体替换。
++	s.commitAlbumLedger(albumPath, !exclude, ctx.Err() == nil)
+ 	return waitErr
+ }
+ 
+@@ -504,6 +525,9 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 		filenameDate = "00000000000000"
+ 	}
+ 
++	// 该照片/视频在空间侧的稳定身份，账本登记与「是否可离线跳过」都以它为准。
++	sourceID := s.albumMediaSourceID(targetUin, album, sloc)
++
+ 	var tasks []mediaTask
+ 	isVideo := photo.Get("is_video").Bool()
+ 
+@@ -567,13 +591,22 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 	for _, task := range tasks {
+ 		isSkip := false
+ 		var route videoRoute
+-		// 增量模式：本地已有同名（无扩展名）文件，且体积看起来完整，则跳过下载。
++		// 增量模式：本地已有同名（无扩展名）文件时，先用账本做纯本地核对。
+ 		if exclude {
+ 			base := strings.TrimSuffix(task.filename, filepath.Ext(task.filename))
+ 			if existingPath, ok := localFiles[base]; ok {
+ 				task.filename = filepath.Base(existingPath)
+-				if s.shouldSkipExisting(ctx, existingPath, task.candidates) {
++				switch s.ledger.SkipDecision(sourceID) {
++				case LedgerSkipHealthy:
++					// 路径 + 字节数 + 摘要与账本一致：直接离线跳过，不发 HEAD。
+ 					isSkip = true
++				case LedgerSkipMismatch:
++					// 账本登记过但当前文件缺失或内容不一致：必须重下，不能再被 HEAD 大小判定跳过。
++				default:
++					// 账本里没有这个来源：沿用旧的 HEAD Content-Length 判定，但不据此登记账本健康。
++					if s.shouldSkipExisting(ctx, existingPath, task.candidates) {
++						isSkip = true
++					}
+ 				}
+ 			}
+ 		}
+@@ -619,6 +652,12 @@ func (s *Spider) downloadItem(ctx context.Context, p *mpb.Progress, targetUin st
+ 			}
+ 		}
+ 
++		// 只有真正新下载完成的文件才登记（走到这里说明下载成功；失败已 continue）。
++		// 账本跳过与旧 HEAD 跳过都不改变账本；失败项在上面 continue，绝不会被登记。
++		if !isSkip {
++			s.stageCompletedMedia(sourceID, actualTarget)
++		}
++
+ 		s.updateResults(isSkip, task.isVideo)
+ 
+ 		if !isSkip && task.isVideo {
+diff --git a/internal/app/spider_integrity_test.go b/internal/app/spider_integrity_test.go
+new file mode 100644
+index 0000000..ecd452e
+--- /dev/null
++++ b/internal/app/spider_integrity_test.go
+@@ -0,0 +1,189 @@
++// 相册 Spider 与完整性账本衔接的本地测试：跳过决策、暂存提交、全量替换、取消不提交。
++
++package app
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/qinjintian/qq-zone/internal/qzone"
++	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
++)
++
++func newTestSpiderLedger(t *testing.T, kind LedgerKind, groupID string) (*Spider, string) {
++	t.Helper()
++	root := t.TempDir()
++	owner := "10001"
++	l := NewLedger(kind, owner, groupID, root)
++	s := &Spider{
++		logger:     zap.NewNop().Sugar(),
++		ledger:     l,
++		ledgerRoot: root,
++	}
++	if kind == LedgerKindGroupAlbum {
++		s.groupID = groupID
++		s.client = &qzone.Client{QQ: owner}
++	}
++	return s, root
++}
++
++func TestLedgerSkipDecisionFourBranches(t *testing.T) {
++	root := t.TempDir()
++	l := NewLedger(LedgerKindAlbum, "10001", "", root)
++	rel := "旅行/IMG_1.jpg"
++	size, sum := writeMedia(t, root, rel, "photo-bytes")
++	l.Upsert(LedgerEntry{
++		SourceID: AlbumSourceID("10001", "album1", "sloc1"),
++		RelPath:  rel, Size: size, SHA256: sum, OriginVerified: true, MediaKind: MediaKindImage,
++	})
++
++	// 1) 一致：离线健康，不触网。
++	if got := l.SkipDecision(AlbumSourceID("10001", "album1", "sloc1")); got != LedgerSkipHealthy {
++		t.Fatalf("一致文件应 healthy，实际 %d", got)
++	}
++
++	// 2) 字节被改：mismatch 必须重下。
++	p := filepath.Join(root, filepath.FromSlash(rel))
++	if err := os.WriteFile(p, []byte("tampered"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if got := l.SkipDecision(AlbumSourceID("10001", "album1", "sloc1")); got != LedgerSkipMismatch {
++		t.Fatalf("改动文件应 mismatch，实际 %d", got)
++	}
++
++	// 3) 文件缺失：mismatch。
++	if err := os.Remove(p); err != nil {
++		t.Fatal(err)
++	}
++	if got := l.SkipDecision(AlbumSourceID("10001", "album1", "sloc1")); got != LedgerSkipMismatch {
++		t.Fatalf("缺失文件应 mismatch，实际 %d", got)
++	}
++
++	// 4) 无条目：交给旧逻辑（HEAD/非空），且不得声称账本健康。
++	if got := l.SkipDecision(AlbumSourceID("10001", "album1", "other-sloc")); got != LedgerSkipNoEntry {
++		t.Fatalf("无条目应 noEntry，实际 %d", got)
++	}
++}
++
++func TestSpiderStageAndCommitAlbum(t *testing.T) {
++	s, root := newTestSpiderLedger(t, LedgerKindAlbum, "")
++	albumPath := filepath.Join(root, "旅行")
++
++	// 账本里先放同相册的旧条目（模拟全量重下前的状态）和另一个相册的条目。
++	s.ledger.Upsert(LedgerEntry{SourceID: "album:10001:old:gone", RelPath: "旅行/old.jpg", SHA256: "x"})
++	s.ledger.Upsert(LedgerEntry{SourceID: "album:10001:keep:1", RelPath: "生活/keep.jpg", SHA256: "y"})
++	// 同路径基线 local 条目，在线登记后应被替换。
++	s.ledger.Upsert(LedgerEntry{SourceID: LocalSourceID("旅行/IMG_20200101_a.jpg"), RelPath: "旅行/IMG_20200101_a.jpg", SHA256: "base", OriginVerified: false})
++
++	writeMedia(t, root, "旅行/IMG_20200101_a.jpg", "new-a")
++	writeMedia(t, root, "旅行/2020/01/VID_b.mp4", "video-b")
++
++	s.stageCompletedMedia(AlbumSourceID("10001", "album1", "slocA"), filepath.Join(root, "旅行/IMG_20200101_a.jpg"))
++	s.stageCompletedMedia(AlbumSourceID("10001", "album1", "slocB"), filepath.Join(root, "旅行/2020/01/VID_b.mp4"))
++	s.commitAlbumLedger(albumPath, true, true) // 全量、干净边界
++
++	reloaded, err := LoadLedger(root)
++	if err != nil {
++		t.Fatalf("提交后重新加载: %v", err)
++	}
++	if reloaded.Count() != 3 {
++		t.Fatalf("条目数 = %d（应为：旅行2 + 生活1）", reloaded.Count())
++	}
++	if _, ok := reloaded.FindBySource("album:10001:old:gone"); ok {
++		t.Fatal("全量替换后旧前缀条目应被移除")
++	}
++	if _, ok := reloaded.FindBySource("album:10001:keep:1"); !ok {
++		t.Fatal("其他相册条目必须保留")
++	}
++	e, ok := reloaded.FindBySource(AlbumSourceID("10001", "album1", "slocA"))
++	if !ok || !e.OriginVerified {
++		t.Fatalf("在线条目应已验证: %+v", e)
++	}
++	if _, ok := reloaded.FindBySource(LocalSourceID("旅行/IMG_20200101_a.jpg")); ok {
++		t.Fatal("同路径 local 基线条目应被在线身份替换")
++	}
++	if ve, ok := reloaded.FindBySource(AlbumSourceID("10001", "album1", "slocB")); !ok || ve.MediaKind != MediaKindVideo || ve.RelPath != "旅行/2020/01/VID_b.mp4" {
++		t.Fatalf("视频（含 timeline 子目录）登记错误: %+v", ve)
++	}
++}
++
++func TestSpiderCommitAlbumCanceledKeepsPreviousLedger(t *testing.T) {
++	s, root := newTestSpiderLedger(t, LedgerKindAlbum, "")
++	albumPath := filepath.Join(root, "相册")
++	s.ledger.Upsert(LedgerEntry{SourceID: "album:10001:a:1", RelPath: "相册/old.jpg", SHA256: "old"})
++	if err := s.ledger.Save(); err != nil {
++		t.Fatal(err)
++	}
++	oldData, err := os.ReadFile(LedgerPath(root))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	writeMedia(t, root, "相册/half.jpg", "half")
++	s.stageCompletedMedia(AlbumSourceID("10001", "a", "half"), filepath.Join(root, "相册/half.jpg"))
++	s.commitAlbumLedger(albumPath, false, false) // 取消：非干净边界
++
++	newData, err := os.ReadFile(LedgerPath(root))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(oldData) != string(newData) {
++		t.Fatal("取消时账本文件必须保持为上一版")
++	}
++	reloaded, _ := LoadLedger(root)
++	if reloaded.Count() != 1 {
++		t.Fatalf("取消提交不得追加条目，实际 %d", reloaded.Count())
++	}
++}
++
++func TestGroupSpiderLedgerIdentityAndRoot(t *testing.T) {
++	s, root := newTestSpiderLedger(t, LedgerKindGroupAlbum, "90001")
++	if got := s.ledgerDomainRoot("10001"); got != filepath.Join("storage", "qzone", "10001", "qun", "90001") {
++		t.Fatalf("群域根错误: %s", got)
++	}
++	album := gjson.Parse(`{"id":"albumG"}`)
++	if id := s.albumMediaSourceID("10001", album, "slocG"); id != "group:10001:90001:albumG:slocG" {
++		t.Fatalf("群身份错误: %s", id)
++	}
++	writeMedia(t, root, "群相册/IMG_g.jpg", "g")
++	s.stageCompletedMedia("group:10001:90001:albumG:slocG", filepath.Join(root, "群相册/IMG_g.jpg"))
++	s.commitAlbumLedger(filepath.Join(root, "群相册"), false, true)
++	l, err := LoadLedger(root)
++	if err != nil || l.Count() != 1 || l.GroupID != "90001" || l.Kind != LedgerKindGroupAlbum {
++		t.Fatalf("群账本提交错误: %+v err=%v", l, err)
++	}
++}
++
++func TestFullBackupWipeDoesNotTouchDomainLedger(t *testing.T) {
++	// 非增量备份会 RemoveAll 相册子目录；账本在域根 .integrity/，必须存活。
++	s, root := newTestSpiderLedger(t, LedgerKindAlbum, "")
++	albumPath := filepath.Join(root, "A")
++	writeMedia(t, root, "A/x.jpg", "x")
++	s.stageCompletedMedia(AlbumSourceID("10001", "a1", "x"), filepath.Join(root, "A/x.jpg"))
++	s.commitAlbumLedger(albumPath, false, true)
++	if _, err := os.Stat(LedgerPath(root)); err != nil {
++		t.Fatalf("提交后账本应存在: %v", err)
++	}
++
++	// 模拟 buildLocalFileIndex(albumPath, false) 的清空相册目录行为。
++	if err := os.RemoveAll(albumPath); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := LoadLedger(root); err != nil {
++		t.Fatalf("清空相册目录不得损坏域根账本: %v", err)
++	}
++}
++
++func TestStageIgnoresPathOutsideRoot(t *testing.T) {
++	s, _ := newTestSpiderLedger(t, LedgerKindAlbum, "")
++	outside := filepath.Join(t.TempDir(), "escape.jpg")
++	if err := os.WriteFile(outside, []byte("x"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	s.stageCompletedMedia(AlbumSourceID("10001", "a", "e"), outside)
++	if len(s.staged) != 0 {
++		t.Fatalf("域根之外的文件不得暂存: %+v", s.staged)
++	}
++}
+diff --git a/internal/app/spider_ledger.go b/internal/app/spider_ledger.go
+new file mode 100644
+index 0000000..52abdda
+--- /dev/null
++++ b/internal/app/spider_ledger.go
+@@ -0,0 +1,140 @@
++// 相册/群相册爬虫与完整性账本的衔接：打开账本、暂存完成条目、在相册边界原子提交。
++// 只有下载链路成功返回的最终文件才会 stage；失败项、跳过项（不改变账本）都不进暂存区。
++
++package app
++
++import (
++	"errors"
++	"path/filepath"
++	"strings"
++
++	"github.com/tidwall/gjson"
++)
++
++// initLedger 在一次下载/重试开始时打开域根账本。
++// 账本不存在时新建内存账本（首次提交才落盘）；账本与备份双损坏时中止任务，禁止用空账本覆盖。
++func (s *Spider) initLedger(targetUin string) error {
++	kind := LedgerKindAlbum
++	if s.isGroupMode() {
++		kind = LedgerKindGroupAlbum
++	}
++	root := s.ledgerDomainRoot(targetUin)
++
++	l, err := LoadLedger(root)
++	if errors.Is(err, ErrLedgerMissing) {
++		groupID := ""
++		if s.isGroupMode() {
++			groupID = s.groupID
++		}
++		l = NewLedger(kind, targetUin, groupID, root)
++		err = nil
++	}
++	if err != nil {
++		return err
++	}
++
++	s.ledgerMu.Lock()
++	s.ledger = l
++	s.ledgerRoot = root
++	s.staged = nil
++	s.ledgerMu.Unlock()
++	return nil
++}
++
++// ledgerDomainRoot 返回当前 Spider 对应的账本域根（个人 album / 群 qun/<gid>）。
++func (s *Spider) ledgerDomainRoot(targetUin string) string {
++	if s.isGroupMode() {
++		return GroupLedgerRoot(targetUin, s.groupID)
++	}
++	return AlbumLedgerRoot(targetUin)
++}
++
++// albumMediaSourceID 生成相册内一张照片/视频的稳定来源身份。
++func (s *Spider) albumMediaSourceID(targetUin string, album gjson.Result, sloc string) string {
++	albumID := album.Get("id").String()
++	if s.isGroupMode() {
++		return GroupSourceID(targetUin, s.groupID, albumID, sloc)
++	}
++	return AlbumSourceID(targetUin, albumID, sloc)
++}
++
++// stageCompletedMedia 对一个真正写完并关闭的最终文件计算摘要并放入暂存区。
++// 只在下载成功（非账本跳过）后调用；路径逃逸域根或摘要失败时记调试日志且不登记。
++func (s *Spider) stageCompletedMedia(sourceID, actualTarget string) {
++	if s == nil || s.ledger == nil || sourceID == "" {
++		return
++	}
++	rel, err := filepath.Rel(s.ledgerRoot, actualTarget)
++	if err != nil {
++		s.logger.Debugf("ledger: 无法计算相对路径 %s: %v", actualTarget, err)
++		return
++	}
++	rel = filepath.ToSlash(rel)
++	if rel == "." || strings.HasPrefix(rel, "..") {
++		s.logger.Debugf("ledger: 跳过域根之外的文件 %s", actualTarget)
++		return
++	}
++	entry, err := EntryFromFile(s.ledgerRoot, rel, sourceID, true)
++	if err != nil {
++		s.logger.Debugf("ledger: 登记摘要失败 %s: %v", actualTarget, err)
++		return
++	}
++
++	s.ledgerMu.Lock()
++	s.staged = append(s.staged, entry)
++	s.ledgerMu.Unlock()
++}
++
++// drainStaged 取出并清空暂存区。
++func (s *Spider) drainStaged() []LedgerEntry {
++	s.ledgerMu.Lock()
++	defer s.ledgerMu.Unlock()
++	staged := s.staged
++	s.staged = nil
++	return staged
++}
++
++// commitAlbumLedger 在单个相册完整跑完时把本相册成果合并进账本并原子提交。
++// fullReplace=true（非增量）时先整体移除该相册目录前缀的旧条目；
++// clean=false（任务被取消/出错未到干净边界）时丢弃本相册暂存，保留上一份账本。
++func (s *Spider) commitAlbumLedger(albumPath string, fullReplace, clean bool) {
++	if s == nil || s.ledger == nil {
++		return
++	}
++	staged := s.drainStaged()
++	if !clean {
++		return
++	}
++
++	if fullReplace {
++		if rel, err := filepath.Rel(s.ledgerRoot, albumPath); err == nil {
++			prefix := filepath.ToSlash(rel) + "/"
++			if !strings.HasPrefix(prefix, "..") {
++				s.ledger.RemoveByRelPathPrefix(prefix)
++			}
++		}
++	}
++	for _, e := range staged {
++		s.ledger.Upsert(e)
++	}
++	if err := s.ledger.Save(); err != nil {
++		s.logger.Warnf("⚠️ 完整性账本提交失败（不影响已下载文件；这些文件在下次被重新在线下载时会补登记，也可在完整性核验后纳入本地基线）: %v", err)
++	}
++}
++
++// commitStagedLedger 用于失败重试这类跨相册任务：结束时一次性合并提交；取消时保留旧账本。
++func (s *Spider) commitStagedLedger(clean bool) {
++	if s == nil || s.ledger == nil {
++		return
++	}
++	staged := s.drainStaged()
++	if !clean {
++		return
++	}
++	for _, e := range staged {
++		s.ledger.Upsert(e)
++	}
++	if err := s.ledger.Save(); err != nil {
++		s.logger.Warnf("⚠️ 完整性账本提交失败（不影响已下载文件；这些文件在下次被重新在线下载时会补登记，也可在完整性核验后纳入本地基线）: %v", err)
++	}
++}
+diff --git a/internal/app/task_record.go b/internal/app/task_record.go
+index c78acda..348465c 100644
+--- a/internal/app/task_record.go
++++ b/internal/app/task_record.go
+@@ -25,6 +25,7 @@ const (
+ 	TaskModeShuoShuo    TaskMode = "shuoshuo"     // 备份说说并生成本地查看页
+ 	TaskModeBoard       TaskMode = "board"        // 备份留言板并生成本地查看页
+ 	TaskModeGroupAlbum  TaskMode = "group_album"  // 备份指定群的相册
++	TaskModeRepair      TaskMode = "repair"       // 完整性核验后的定点修复
+ )
+ 
+ // TaskStatus 是任务落盘时的最终（或进行中）状态，由 CLI 根据下载结果判定后写入。
+diff --git a/internal/cli/integrity.go b/internal/cli/integrity.go
+new file mode 100644
+index 0000000..20a8f0d
+--- /dev/null
++++ b/internal/cli/integrity.go
+@@ -0,0 +1,415 @@
++// 完整性核验与修复的终端交互入口。核验全程不登录、不联网；只有用户显式选择修复时才请求登录。
++
++package cli
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"strings"
++
++	"github.com/AlecAivazis/survey/v2"
++	"github.com/fatih/color"
++	"github.com/olekukonko/tablewriter"
++	"github.com/qinjintian/qq-zone/internal/app"
++	"github.com/vbauerster/mpb/v8"
++	"github.com/vbauerster/mpb/v8/decor"
++)
++
++const (
++	integrityVerifyAll  = "🧾 核验全部备份"
++	integrityGoBack     = "↩ 返回上一级"
++	integrityActRepair  = "repair"
++	integrityActAdopt   = "adopt"
++	integrityActDiscard = "discard"
++)
++
++// handleIntegrity 是免登录的完整性核验与修复入口。
++func (c *CLI) handleIntegrity(ctx context.Context) {
++	domains := app.DiscoverLedgerRoots()
++	if len(domains) == 0 {
++		c.logger.Info("📂 本机 storage/ 下还没有发现任何备份目录（相册/群相册/说说/留言板），先完成一次备份再来核验。")
++		return
++	}
++
++	options := []string{integrityVerifyAll}
++	domainMap := map[string]app.LedgerDomain{}
++	for _, d := range domains {
++		label := integrityDomainLabel(d)
++		options = append(options, label)
++		domainMap[label] = d
++	}
++	options = append(options, integrityGoBack)
++
++	var selected string
++	if err := askOne(&survey.Select{
++		Message:  "选择要核验的备份（核验不登录、不联网）:",
++		Options:  options,
++		PageSize: 14,
++	}, &selected, survey.WithIcons(func(icons *survey.IconSet) {
++		icons.Question.Text = "🧪"
++		icons.SelectFocus.Text = "▶"
++	})); err != nil || selected == integrityGoBack {
++		return
++	}
++
++	if selected == integrityVerifyAll {
++		for _, d := range domains {
++			c.verifyOneDomain(ctx, d, false)
++		}
++		return
++	}
++	if d, ok := domainMap[selected]; ok {
++		c.verifyOneDomain(ctx, d, true)
++	}
++}
++
++// integrityDomainLabel 渲染单个域根的菜单行。
++func integrityDomainLabel(d app.LedgerDomain) string {
++	typeName := map[app.LedgerKind]string{
++		app.LedgerKindAlbum:      "个人相册",
++		app.LedgerKindGroupAlbum: "群相册",
++		app.LedgerKindShuoshuo:   "说说",
++		app.LedgerKindBoard:      "留言板",
++	}[d.Kind]
++	target := d.OwnerUin
++	if d.Kind == app.LedgerKindGroupAlbum {
++		target = d.OwnerUin + " / 群 " + d.GroupID
++	}
++	switch {
++	case d.Corrupt:
++		return fmt.Sprintf("[%s] %s | %s", typeName, target, color.RedString("账本损坏"))
++	case d.HasLedger:
++		return fmt.Sprintf("[%s] %s | 账本: %s（%d 条）", typeName, target, color.GreenString("已有"), d.EntryCount)
++	default:
++		return fmt.Sprintf("[%s] %s | 账本: %s", typeName, target, color.YellowString("无（可建基线）"))
++	}
++}
++
++// verifyOneDomain 跑单个域根的核验并提供后续动作；interactive=false（全部核验）时只报告不进入修复。
++func (c *CLI) verifyOneDomain(ctx context.Context, d app.LedgerDomain, interactive bool) {
++	color.Cyan("\n━━━━━━━━━━━━━━━━━━ 核验：%s ━━━━━━━━━━━━━━━━━━", integrityDomainLabel(d))
++
++	if d.Corrupt {
++		c.logger.Errorf("❌ %s 的账本 ledger.json 与 ledger.bak 均无法解析。为避免覆盖可信记录，已跳过；请人工检查 .integrity/ 目录。", d.Root)
++		return
++	}
++
++	if !d.HasLedger {
++		c.offerBaselineOrScan(ctx, d)
++		return
++	}
++
++	// 存在未完成修复计划时，先提示可直接续作。
++	if app.HasPendingRepair(d.Root) {
++		c.logger.Warn("📌 该备份存在上次未完成的修复计划（无凭证、断网或取消会保留，健康文件不会被重下）。")
++		if interactive && c.askYesNo("是否直接继续执行修复计划？将移动损坏文件到隔离区并需要登录，健康文件不会重写。", true) {
++			c.runRepair(ctx, d, nil, true)
++			return
++		}
++	}
++
++	report := c.runVerifyWithProgress(d)
++	c.renderVerifyReport(d, report)
++
++	if !interactive || report.ProblemCount() == 0 {
++		return
++	}
++
++	c.offerPostVerifyActions(ctx, d, report)
++}
++
++// offerBaselineOrScan 处理无账本旧备份：显式建基线，或仅扫描现存媒体。
++func (c *CLI) offerBaselineOrScan(ctx context.Context, d app.LedgerDomain) {
++	var choice string
++	if err := askOne(&survey.Select{
++		Message: "该备份还没有完整性账本：",
++		Options: []string{
++			"🏗 建立本地基线（仅记录当前字节，来源未验证）",
++			"🔍 仅扫描现存媒体与未完成项（不写账本）",
++			integrityGoBack,
++		},
++	}, &choice); err != nil || choice == integrityGoBack {
++		return
++	}
++
++	if strings.HasPrefix(choice, "🔍") {
++		report := app.ScanRootWithoutLedger(d.Kind, d.Root, nil)
++		c.renderVerifyReport(d, report)
++		c.logger.Info(color.HiBlackString("提示：未登记文件可通过「建立本地基线」获得来源未验证登记；建基线不代表已与空间原件核对。"))
++		return
++	}
++
++	c.logger.Warn("⚠️ " + app.BaselineNotice)
++	if !c.askYesNo("确认只为当前磁盘字节建立「来源未验证」基线？", false) {
++		return
++	}
++	l, res, err := app.EstablishBaseline(d.Kind, d.OwnerUin, d.GroupID, d.Root, nil)
++	if err != nil {
++		c.logger.Errorf("❌ 建立基线失败: %v", err)
++		return
++	}
++	c.logger.Infof("✅ 基线已建立：%s（登记 %d 个媒体；账本 %s）", d.Root, res.EntryCount, app.LedgerPath(d.Root))
++	if len(res.IncompleteList) > 0 {
++		c.logger.Warnf("🚧 以下未完成文件未纳入基线（%d 个）: %s", len(res.IncompleteList), strings.Join(limitForDisplay(res.IncompleteList, 10), ", "))
++	}
++	_ = l
++	// 建完基线立即核验一次，让用户看到健康（未验证）状态。
++	report, err := app.VerifyRoot(d.Root, nil)
++	if err == nil {
++		c.renderVerifyReport(d, report)
++		if report.ProblemCount() > 0 {
++			c.offerPostVerifyActions(ctx, d, report)
++		}
++	}
++}
++
++// runVerifyWithProgress 用进度条执行核验；核验只读。
++func (c *CLI) runVerifyWithProgress(d app.LedgerDomain) *app.VerifyReport {
++	p := mpb.NewWithContext(context.Background())
++	bar := p.AddBar(1,
++		mpb.BarRemoveOnComplete(),
++		mpb.PrependDecorators(
++			decor.Name("本地核验 ", decor.WC{W: 16, C: decor.DindentRight}),
++			decor.CountersNoUnit("%d / %d 个文件"),
++		),
++		mpb.AppendDecorators(decor.Percentage()),
++	)
++	var report *app.VerifyReport
++	var verr error
++	progress := func(done, total int, _ string) {
++		bar.SetTotal(int64(total), false)
++		bar.SetCurrent(int64(done))
++	}
++	report, verr = app.VerifyRoot(d.Root, progress)
++	bar.SetTotal(-1, true)
++	p.Wait()
++	if verr != nil {
++		c.logger.Errorf("❌ 核验失败: %v", verr)
++		return nil
++	}
++	return report
++}
++
++// offerPostVerifyActions 报告之后的动作菜单：修复 / 纳入未登记 / 丢弃既有计划 / 返回。
++func (c *CLI) offerPostVerifyActions(ctx context.Context, d app.LedgerDomain, report *app.VerifyReport) {
++	var options []string
++	options = append(options, "🔧 修复以上问题（只重建确认损坏/缺失项，需要登录）")
++	if len(report.Section(app.VerifyUnregistered)) > 0 {
++		options = append(options, "📥 把未登记项纳入基线（来源未验证，不修改文件）")
++	}
++	if app.HasPendingRepair(d.Root) {
++		options = append(options, "🗑 丢弃上次未完成的修复计划")
++	}
++	options = append(options, integrityGoBack)
++
++	var choice string
++	if err := askOne(&survey.Select{Message: "接下来：", Options: options}, &choice); err != nil || choice == integrityGoBack {
++		return
++	}
++	switch {
++	case strings.HasPrefix(choice, "🔧"):
++		plan := app.NewRepairPlan(d, report)
++		if len(plan.Items) == 0 {
++			c.logger.Info("没有可自动修复的项目（未登记项请用「纳入基线」）。")
++			return
++		}
++		c.runRepair(ctx, d, plan, false)
++	case strings.HasPrefix(choice, "📥"):
++		c.adoptUnregistered(d, report)
++	case strings.HasPrefix(choice, "🗑"):
++		c.discardPlan(d)
++	}
++}
++
++// runRepair 执行修复。alreadyConfirmed=true 表示用户已在「继续既有计划」处确认；
++// 新计划必须在落盘前再做一次独立确认（FR-9）。
++func (c *CLI) runRepair(ctx context.Context, d app.LedgerDomain, plan *app.RepairPlan, alreadyConfirmed bool) {
++	if plan == nil {
++		loaded, err := app.LoadRepairPlan(d.Root)
++		if err != nil {
++			c.logger.Errorf("❌ 没有可继续的修复计划: %v", err)
++			return
++		}
++		plan = loaded
++	}
++	if len(plan.Items) == 0 {
++		c.logger.Info("修复计划为空。")
++		return
++	}
++
++	if !alreadyConfirmed {
++		c.logger.Warn("修复将仅处理计划内的缺失/损坏/未完成项：损坏文件先移动到 .integrity/quarantine/ 隔离，" +
++			"再通过该备份类型原有的下载与换源链路重建；健康文件不会被重写。修复需要登录。")
++		if !c.askYesNo(fmt.Sprintf("确认开始修复这 %d 项？", len(plan.Items)), false) {
++			c.logger.Info("已取消，未对文件做任何改动。")
++			return
++		}
++	}
++
++	// 先持久化计划，再登录：无凭证/取消/断网后下次都能继续，媒体文件未做任何改动。
++	if err := plan.Save(); err != nil {
++		c.logger.Errorf("❌ 修复计划无法落盘，已中止: %v", err)
++		return
++	}
++	c.logger.Infof("🧾 修复计划已保存（%d 项）：%s；损坏/未完成文件将先隔离到 .integrity/quarantine/ 再重建，健康文件不会被重写。",
++		len(plan.Items), app.RepairPlanPath(d.Root))
++
++	if c.client == nil {
++		if err := c.ensureLogin(ctx); err != nil {
++			c.logger.Warn("⚠️ 未登录，修复计划已保留，下次可在同一入口继续。")
++			return
++		}
++	}
++
++	taskLogger := c.createTaskLogger(d.OwnerUin)
++	record := app.NewTaskRecord(app.TaskModeRepair, c.client.QQ, d.OwnerUin, nil, c.config, true)
++	if d.Kind == app.LedgerKindGroupAlbum {
++		record.GroupID = d.GroupID
++	}
++	c.saveTaskRecord(record, nil, nil, app.TaskStatusPending)
++
++	runner := app.NewOnlineRepairRunner(c.client, c.config, taskLogger)
++	fmt.Println(color.HiBlackString("\n━━━━━━━━━━━━━━━━━━━━━━ 正在定点修复 ━━━━━━━━━━━━━━━━━━━━━━"))
++	outcome, runErr := app.ExecuteRepair(ctx, d, plan, runner, taskLogger)
++	fmt.Println(color.HiBlackString("━━━━━━━━━━━━━━━━━━━━━━ 修复结束 ━━━━━━━━━━━━━━━━━━━━━━"))
++
++	status := c.determineTaskStatus(ctx, outcome.Result, runErr)
++	if runErr != nil && status != app.TaskStatusCancelled {
++		status = app.TaskStatusPartial
++	}
++	c.saveTaskRecord(record, outcome.Result, runErr, status)
++	if runErr != nil {
++		taskLogger.Errorf("❌ 修复中断（计划已保留，可继续；已隔离文件保留在 .integrity/quarantine/，续作会重新下载）: %v", runErr)
++	}
++	c.renderRepairOutcome(d, outcome)
++}
++
++// adoptUnregistered 把未登记媒体纳入既有账本（local、未验证）。
++func (c *CLI) adoptUnregistered(d app.LedgerDomain, report *app.VerifyReport) {
++	items := report.Section(app.VerifyUnregistered)
++	c.logger.Warn("⚠️ " + app.BaselineNotice)
++	if !c.askYesNo(fmt.Sprintf("确认把 %d 个未登记文件纳入基线（来源未验证、不修改文件）？", len(items)), false) {
++		return
++	}
++	added, err := app.AdoptUnregistered(d.Root, report, nil)
++	if err != nil {
++		c.logger.Errorf("❌ 纳入基线失败: %v", err)
++		return
++	}
++	c.logger.Infof("✅ 已纳入 %d 个未登记文件（来源未验证）。", added)
++}
++
++// discardPlan 经确认后丢弃既有修复计划。
++func (c *CLI) discardPlan(d app.LedgerDomain) {
++	plan, err := app.LoadRepairPlan(d.Root)
++	if err != nil {
++		return
++	}
++	if !c.askYesNo(fmt.Sprintf("确认丢弃 %d 项未完成修复计划？（不会删除任何媒体文件）", len(plan.Items)), false) {
++		return
++	}
++	if err := plan.Remove(); err != nil {
++		c.logger.Errorf("❌ 丢弃计划失败: %v", err)
++		return
++	}
++	c.logger.Info("🧹 修复计划已丢弃。")
++}
++
++// renderRepairOutcome 打印修复结果汇总。
++func (c *CLI) renderRepairOutcome(d app.LedgerDomain, o *app.RepairOutcome) {
++	green := color.New(color.FgGreen).SprintFunc()
++	red := color.New(color.FgRed, color.Bold).SprintFunc()
++	yellow := color.New(color.FgYellow).SprintFunc()
++	c.logger.Infof("🔧 修复结果：%s %d 项；%s %d 项；%s %d 项",
++		green("已重建"), len(o.Resolved), red("仍失败"), len(o.Remaining), yellow("不可自动修复"), len(o.Unrepairable))
++	if len(o.Unrepairable) > 0 {
++		c.logger.Warn("以下项目缺少在线取源线索（多为基线身份），请对对应相册/说说重新执行一次在线备份：")
++		for _, it := range o.Unrepairable {
++			c.logger.Warnf("  - %s", it.RelPath)
++		}
++	}
++	if len(o.Remaining) > 0 {
++		c.logger.Info("计划已保留，下次进入本入口可继续修复；失败明细：")
++		for _, it := range o.Remaining {
++			c.logger.Infof("  - %s [%s] %s", it.RelPath, it.Reason, it.LastError)
++		}
++	}
++}
++
++// renderVerifyReport 在终端分段打印核验结果（缺失/变更/未登记/未完成 + 健康汇总）。
++func (c *CLI) renderVerifyReport(d app.LedgerDomain, r *app.VerifyReport) {
++	if r == nil {
++		return
++	}
++	bold := color.New(color.Bold).SprintFunc()
++	green := color.New(color.FgGreen).SprintFunc()
++	red := color.New(color.FgRed, color.Bold).SprintFunc()
++	yellow := color.New(color.FgYellow).SprintFunc()
++	magenta := color.New(color.FgMagenta).SprintFunc()
++	cyan := color.New(color.FgCyan, color.Bold).SprintFunc()
++
++	header := fmt.Sprintf("\n%s %s（%s）", bold(cyan("🧪 本地核验报告")), integrityDomainLabel(d), d.Root)
++	c.logger.Info(header)
++	c.logger.Infof(" ✅ 健康：%s（来源已验证） + %s（基线/来源未验证）",
++		green("%d", r.HealthyVerified), yellow("%d", r.HealthyUnverified))
++
++	c.renderVerifySection(red("❌ 缺失"), r.Section(app.VerifyMissing), []string{"相对路径", "来源", "期望大小"})
++	c.renderVerifySection(red("🔀 内容变更"), r.Section(app.VerifyChanged), []string{"相对路径", "期望 → 实际", "来源"})
++	c.renderVerifySection(magenta("🚧 未完成"), r.Section(app.VerifyIncomplete), []string{"相对路径", "标记/说明"})
++	c.renderVerifySection(yellow("❓ 未登记"), r.Section(app.VerifyUnregistered), []string{"相对路径", "大小"})
++
++	c.logger.Infof("%s 问题合计 %d 项。核验未访问网络，也未修改任何文件或账本。",
++		bold("━━ 汇总 ━━"), r.ProblemCount())
++}
++
++// renderVerifySection 打印一个分类的表格；空分类给一行绿色提示。
++func (c *CLI) renderVerifySection(title string, items []app.VerifyItem, headers []string) {
++	if len(items) == 0 {
++		c.logger.Infof(" %s：无", title)
++		return
++	}
++	c.logger.Infof(" %s（%d）:", title, len(items))
++	tb := tablewriter.NewWriter(os.Stdout)
++	tb.SetHeader(headers)
++	tb.SetAutoWrapText(true)
++	tb.SetColWidth(46)
++	tb.SetBorder(false)
++	tb.SetCenterSeparator("")
++	tb.SetColumnSeparator("")
++	tb.SetRowSeparator("")
++	tb.SetHeaderLine(false)
++	tb.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
++	tb.SetAlignment(tablewriter.ALIGN_LEFT)
++	for _, it := range items {
++		switch it.Status {
++		case app.VerifyMissing:
++			tb.Append([]string{it.RelPath, it.SourceID, fmt.Sprintf("%d", it.WantSize)})
++		case app.VerifyChanged:
++			tb.Append([]string{it.RelPath, fmt.Sprintf("%d → %d", it.WantSize, it.GotSize), it.SourceID})
++		case app.VerifyIncomplete:
++			tb.Append([]string{it.RelPath, it.Detail})
++		default:
++			tb.Append([]string{it.RelPath, fmt.Sprintf("%d", it.GotSize)})
++		}
++	}
++	tb.Render()
++	fmt.Println()
++}
++
++// askYesNo 是一个简单的确认提问，默认值可设。
++func (c *CLI) askYesNo(message string, defaultYes bool) bool {
++	var ok bool
++	if err := askOne(&survey.Confirm{Message: message, Default: defaultYes}, &ok); err != nil {
++		return false
++	}
++	return ok
++}
++
++// limitForDisplay 截断过长列表用于终端提示。
++func limitForDisplay(items []string, n int) []string {
++	if len(items) <= n {
++		return items
++	}
++	return append(items[:n], fmt.Sprintf("…（其余 %d 项略）", len(items)-n))
++}
+diff --git a/internal/cli/menu.go b/internal/cli/menu.go
+index 4b4f6ad..4bb9757 100644
+--- a/internal/cli/menu.go
++++ b/internal/cli/menu.go
+@@ -117,7 +117,7 @@ func (c *CLI) Menu(ctx context.Context) {
+ 
+ 		prompt := &survey.Select{
+ 			Message:  color.New(color.FgCyan, color.Bold).Sprint(menuMsg),
+-			PageSize: 14,
++		PageSize: 15,
+ 			Options: []string{
+ 				"🏠 下载自己的相册",
+ 				"📂 下载群相册",
+@@ -127,12 +127,13 @@ func (c *CLI) Menu(ctx context.Context) {
+ 				"💭 备份好友的说说",
+ 				"🗒️ 备份好友的留言板",
+ 				"📖 查看说说备份",
+-				"📘 查看留言板备份",
+-				"🔁 重试上次失败项",
+-				"🔍 查看对我开放的好友",
+-				"⚙️ 开启/关闭调试模式",
+-				"🔄 切换账号/重新登录",
+-				"👋 退出程序",
++			"📘 查看留言板备份",
++			"🧪 完整性核验与修复",
++			"🔁 重试上次失败项",
++			"🔍 查看对我开放的好友",
++			"⚙️ 开启/关闭调试模式",
++			"🔄 切换账号/重新登录",
++			"👋 退出程序",
+ 			},
+ 			Description: func(value string, index int) string {
+ 				switch index {
+@@ -153,24 +154,26 @@ func (c *CLI) Menu(ctx context.Context) {
+ 				case 7:
+ 					return "打开已经备份过的说说时间线，无需重新登录"
+ 				case 8:
+-					return "打开已经备份过的留言板，无需重新登录"
+-				case 9:
+-					return "浏览历史失败任务列表，手动选择要重试的任务，仅重试尚未成功的文件"
+-				case 10:
+-					return "自动扫描并列出所有允许您访问空间的好友及其相册概况"
+-				case 11:
+-					status := "关闭"
+-					if c.logFact.IsDebug() {
+-						status = "开启"
+-					}
+-					return fmt.Sprintf("记录 API 日志，并在备份时标注视频拉取链路 (当前: %s)", status)
+-				case 12:
+-					return "注销当前登录状态，并准备扫码登录新账号"
+-				case 13:
+-					return "结束本次备份任务并安全退出"
+-				default:
+-					return ""
++				return "打开已经备份过的留言板，无需重新登录"
++			case 9:
++				return "无需登录/联网：按账本核验本地照片视频，报告缺失、改动、未登记与未完成，并可定点修复"
++			case 10:
++				return "浏览历史失败任务列表，手动选择要重试的任务，仅重试尚未成功的文件"
++			case 11:
++				return "自动扫描并列出所有允许您访问空间的好友及其相册概况"
++			case 12:
++				status := "关闭"
++				if c.logFact.IsDebug() {
++					status = "开启"
+ 				}
++				return fmt.Sprintf("记录 API 日志，并在备份时标注视频拉取链路 (当前: %s)", status)
++			case 13:
++				return "注销当前登录状态，并准备扫码登录新账号"
++			case 14:
++				return "结束本次备份任务并安全退出"
++			default:
++				return ""
++			}
+ 			},
+ 		}
+ 
+@@ -261,6 +264,9 @@ func (c *CLI) Menu(ctx context.Context) {
+ 			c.handleViewMood()
+ 		case strings.Contains(option, "查看留言板备份"):
+ 			c.handleViewBoard()
++		case strings.Contains(option, "完整性核验与修复"):
++			// 明确不做 ensureLogin：核验全程离线，修复动作内部才按需登录。
++			c.handleIntegrity(ctx)
+ 		case strings.Contains(option, "重试上次失败项"):
+ 			if c.client == nil {
+ 				if err := c.ensureLogin(ctx); err != nil {
+diff --git a/internal/net/http/hls.go b/internal/net/http/hls.go
+index a99c6cd..e7e8640 100644
+--- a/internal/net/http/hls.go
++++ b/internal/net/http/hls.go
+@@ -26,6 +26,9 @@ type hlsVariant struct {
+ 	bandwidth int    // EXT-X-STREAM-INF 中的 BANDWIDTH，越大通常越清晰
+ }
+ 
++// hlsPartExt 是 HLS 分片拼接期间的临时文件后缀；成功后才改名去掉它。
++const hlsPartExt = ".part"
++
+ // IsHLSURL 判断 URL 是否为 HLS 播放列表（路径含 .m3u8，或查询串含 m3u8?）。
+ func IsHLSURL(raw string) bool {
+ 	u := strings.ToLower(raw)
+@@ -96,11 +99,14 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
+ 		}
+ 	}
+ 
+-	out, err := os.Create(target)
++	// 分片先写入 <target>.part：只有全部分片写完并关闭后才改名成最终文件。
++	// 中途失败或断电时留下的是 .part 半成品（完整性核验据此识别未完成项），
++	// 绝不会出现一个「最终文件名但内容只有一半」的 HLS 视频。
++	partPath := target + hlsPartExt
++	out, err := os.Create(partPath)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer out.Close()
+ 
+ 	// fMP4 的初始化段必须写在媒体分片前面，否则本地文件无法播放。
+ 	parts := make([]string, 0, len(segments)+1)
+@@ -147,6 +153,7 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
+ 			if bar != nil {
+ 				bar.Abort(true)
+ 			}
++			_ = out.Close()
+ 			return nil, ctx.Err()
+ 		default:
+ 		}
+@@ -156,12 +163,14 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
+ 			if bar != nil {
+ 				bar.Abort(true)
+ 			}
++			_ = out.Close()
+ 			return nil, fmt.Errorf("hls segment download failed: %w", segErr)
+ 		}
+ 		if segStatus != http.StatusOK && segStatus != http.StatusPartialContent {
+ 			if bar != nil {
+ 				bar.Abort(true)
+ 			}
++			_ = out.Close()
+ 			return nil, &StatusError{Code: segStatus, Status: http.StatusText(segStatus)}
+ 		}
+ 		n, writeErr := out.Write(segBody)
+@@ -169,6 +178,7 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
+ 			if bar != nil {
+ 				bar.Abort(true)
+ 			}
++			_ = out.Close()
+ 			return nil, writeErr
+ 		}
+ 		copied += int64(n)
+@@ -184,6 +194,18 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
+ 		bar.SetTotal(-1, true)
+ 	}
+ 
++	// 全部段落盘：先 Sync 再关闭，最后原子改名，最终文件只在这一刻第一次出现。
++	if err := out.Sync(); err != nil {
++		_ = out.Close()
++		return nil, err
++	}
++	if err := out.Close(); err != nil {
++		return nil, err
++	}
++	if err := os.Rename(partPath, target); err != nil {
++		return nil, fmt.Errorf("finalize hls file failed: %w", err)
++	}
++
+ 	return map[string]interface{}{
+ 		"filename": filepath.Base(target),
+ 		"dir":      targetDir,
+diff --git a/internal/net/http/hls_integrity_test.go b/internal/net/http/hls_integrity_test.go
+new file mode 100644
+index 0000000..fab6b80
+--- /dev/null
++++ b/internal/net/http/hls_integrity_test.go
+@@ -0,0 +1,95 @@
++// HLS 完成信号测试：分片先落 .part，全部成功才原子改名；失败只留 .part。
++
++package http
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// hlsFixtureServer 起一个最小 m3u8 服务：EXT-X-MAP 初始化段 + 3 个媒体分片。
++// failSeg >= 0 时，该序号分片返回 500，模拟中途失败。
++func hlsFixtureServer(t *testing.T, failSeg int) *httptest.Server {
++	t.Helper()
++	mux := http.NewServeMux()
++	mux.HandleFunc("/v.m3u8", func(w http.ResponseWriter, r *http.Request) {
++		playlist := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.bin\"\n" +
++			"#EXTINF:1.0,\nseg0.bin\n#EXTINF:1.0,\nseg1.bin\n#EXTINF:1.0,\nseg2.bin\n"
++		fmt.Fprint(w, playlist)
++	})
++	mux.HandleFunc("/init.bin", func(w http.ResponseWriter, r *http.Request) {
++		fmt.Fprint(w, "INIT")
++	})
++	for i := 0; i < 3; i++ {
++		idx := i
++		mux.HandleFunc(fmt.Sprintf("/seg%d.bin", i), func(w http.ResponseWriter, r *http.Request) {
++			if idx == failSeg {
++				w.WriteHeader(http.StatusInternalServerError)
++				return
++			}
++			fmt.Fprintf(w, "SEG%d", idx)
++		})
++	}
++	return httptest.NewServer(mux)
++}
++
++func TestDownloadHLSPartRenamedOnSuccess(t *testing.T) {
++	srv := hlsFixtureServer(t, -1)
++	defer srv.Close()
++
++	target := filepath.Join(t.TempDir(), "out.mp4")
++	c := NewClient()
++	res, err := c.DownloadHLS(context.Background(), srv.URL+"/v.m3u8", target, nil, nil, "out.mp4", "原视频", nil)
++	if err != nil {
++		t.Fatalf("DownloadHLS 失败: %v", err)
++	}
++
++	data, err := os.ReadFile(target)
++	if err != nil {
++		t.Fatalf("最终文件应存在: %v", err)
++	}
++	if string(data) != "INITSEG0SEG1SEG2" {
++		t.Fatalf("拼接内容错误: %q", data)
++	}
++	if _, err := os.Stat(target + hlsPartExt); !os.IsNotExist(err) {
++		t.Fatalf("成功后不应残留 .part，stat err=%v", err)
++	}
++	if got := res["path"]; got != target {
++		t.Fatalf("返回 path = %v, want %s", got, target)
++	}
++	if got := res["filename"]; got != "out.mp4" {
++		t.Fatalf("返回 filename = %v, want out.mp4", got)
++	}
++}
++
++func TestDownloadHLSKeepsOnlyPartOnFailure(t *testing.T) {
++	srv := hlsFixtureServer(t, 1) // seg1 返回 500
++	defer srv.Close()
++
++	target := filepath.Join(t.TempDir(), "broken.mp4")
++	c := NewClient()
++	_, err := c.DownloadHLS(context.Background(), srv.URL+"/v.m3u8", target, nil, nil, "broken.mp4", "原视频", nil)
++	if err == nil {
++		t.Fatal("分片失败时应返回错误")
++	}
++	if HTTPStatus(err) != http.StatusInternalServerError {
++		t.Fatalf("错误应体现分片 500 状态码，实际: %v", err)
++	}
++	if _, err := os.Stat(target); !os.IsNotExist(err) {
++		t.Fatalf("失败时不得产生最终文件名，stat err=%v", err)
++	}
++	part := target + hlsPartExt
++	info, err := os.Stat(part)
++	if err != nil {
++		t.Fatalf("失败后应保留 .part 半成品作为未完成标记: %v", err)
++	}
++	if info.Size() == 0 {
++		t.Fatal(".part 应包含已下载的 init+seg0 字节")
++	}
++}
+diff --git a/internal/pkg/util/util.go b/internal/pkg/util/util.go
+index 409ed27..9882e12 100644
+--- a/internal/pkg/util/util.go
++++ b/internal/pkg/util/util.go
+@@ -4,6 +4,8 @@ package util
+ 
+ import (
+ 	"crypto/md5"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
+ 	"io"
+ 	"math/rand"
+@@ -34,6 +36,33 @@ func FileMD5(path string) (string, error) {
+ 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+ }
+ 
++// digestBufSize 是流式摘要时的固定读缓冲大小（256 KiB），不随文件体积增长。
++const digestBufSize = 256 * 1024
++
++// FileSHA256 以流式读取的方式计算本地文件的 SHA-256 摘要（十六进制字符串）。
++// 适用于视频等大文件完整性核验，常驻内存只有固定大小缓冲。
++func FileSHA256(path string) (string, error) {
++	_, sum, err := FileDigest(path)
++	return sum, err
++}
++
++// FileDigest 一次顺序扫描同时得到字节数与 SHA-256，避免大文件读两遍。
++func FileDigest(path string) (int64, string, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return 0, "", err
++	}
++	defer f.Close()
++
++	h := sha256.New()
++	buf := make([]byte, digestBufSize)
++	n, err := io.CopyBuffer(h, f, buf)
++	if err != nil {
++		return 0, "", err
++	}
++	return n, hex.EncodeToString(h.Sum(nil)), nil
++}
++
+ // RandInt 返回一个位于 [min, max) 区间的伪随机整数
+ func RandInt(min, max int) int {
+ 	if min >= max {

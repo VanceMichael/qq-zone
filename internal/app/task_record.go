@@ -25,6 +25,7 @@ const (
 	TaskModeShuoShuo    TaskMode = "shuoshuo"     // 备份说说并生成本地查看页
 	TaskModeBoard       TaskMode = "board"        // 备份留言板并生成本地查看页
 	TaskModeGroupAlbum  TaskMode = "group_album"  // 备份指定群的相册
+	TaskModeRepair      TaskMode = "repair"       // 完整性核验后的定点修复
 )
 
 // TaskStatus 是任务落盘时的最终（或进行中）状态，由 CLI 根据下载结果判定后写入。

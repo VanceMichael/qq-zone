@@ -33,6 +33,8 @@ type MoodBackup struct {
 	archived  bool   // 列表接口提示更早说说被封存时为 true
 	notice    string // 封存提示文案，写入 backup.json 给查看页顶部展示
 	spaceName string // 被备份空间的昵称，查看页标题用
+
+	ledger mediaLedgerSession // 说说媒体完整性账本会话
 }
 
 // NewMoodBackup 创建说说备份任务。
@@ -51,6 +53,11 @@ func (b *MoodBackup) Backup(ctx context.Context, targetUin string, exclude bool)
 	root := moodRoot(targetUin)
 	if err := os.MkdirAll(filepath.Join(root, "data"), os.ModePerm); err != nil {
 		return nil, err
+	}
+
+	// 打开说说域根完整性账本；双损坏时中止，不允许用空账本覆盖。
+	if err := b.ledger.init(LedgerKindShuoshuo, sourcePrefixShuo, targetUin, root); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
 	}
 
 	existing, _ := loadMoodBackup(root)
@@ -159,6 +166,9 @@ func (b *MoodBackup) Backup(ctx context.Context, targetUin string, exclude bool)
 		return &b.results, fmt.Errorf("生成查看页失败: %w", err)
 	}
 
+	// 账本只在整次备份正常走完（backup.json/查看页都已写好）后提交一次；取消则保留旧版。
+	b.ledger.commit(ctx.Err() == nil, b.logger)
+
 	success := uint64(len(posts))
 	if b.results.Failed > uint64(len(posts)) {
 		success = 0
@@ -174,6 +184,9 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
 	file, err := loadMoodBackup(root)
 	if err != nil {
 		return nil, fmt.Errorf("读取已有说说备份失败: %w", err)
+	}
+	if err := b.ledger.init(LedgerKindShuoshuo, sourcePrefixShuo, targetUin, root); err != nil {
+		return nil, fmt.Errorf("完整性账本不可用: %w", err)
 	}
 
 	byTID := map[string]*MoodPost{}
@@ -201,6 +214,7 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
 		case <-ctx.Done():
 			bar.Abort(true)
 			p.Wait()
+			b.ledger.commit(false, b.logger)
 			return &b.results, ctx.Err()
 		default:
 		}
@@ -243,10 +257,19 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
 		dest := filepath.Join(root, filepath.FromSlash(rel))
 		if util.Exists(dest) {
 			if fi, statErr := os.Stat(dest); statErr == nil && fi.Size() > 0 {
-				atomic.AddUint64(&b.results.Success, 1)
-				atomic.AddUint64(&b.results.Skipped, 1)
-				bar.Increment()
-				continue
+				// 已有非空文件：先问账本。一致才离线跳过；不一致必须重下；无条目沿用旧行为但不登记。
+				decision := LedgerSkipNoEntry
+				if media != nil {
+					decision = b.ledger.decision(tid, media)
+				} else {
+					decision = b.ledger.decisionFor(tid, item.MediaID, item.MediaURL)
+				}
+				if decision != LedgerSkipMismatch {
+					atomic.AddUint64(&b.results.Success, 1)
+					atomic.AddUint64(&b.results.Skipped, 1)
+					bar.Increment()
+					continue
+				}
 			}
 		}
 
@@ -265,6 +288,26 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
 				}
 			}
 		}
+		// 重试补回的文件同样要登记；media 树缺失时用失败项要素兜底构造身份。
+		if media != nil {
+			b.ledger.stage(tid, media)
+		} else {
+			fallback := MoodMedia{ID: item.MediaID, URL: item.MediaURL}
+			if isVideo {
+				fallback.Type = "video"
+			}
+			if res != nil {
+				if path, ok := res["path"].(string); ok {
+					if relPath, relErr := filepath.Rel(root, path); relErr == nil {
+						fallback.Path = filepath.ToSlash(relPath)
+					}
+				}
+			}
+			if fallback.Path == "" {
+				fallback.Path = rel
+			}
+			b.ledger.stage(tid, &fallback)
+		}
 		b.noteMediaSuccess(isVideo)
 		atomic.AddUint64(&b.results.Success, 1)
 		bar.Increment()
@@ -280,6 +323,7 @@ func (b *MoodBackup) RetryFailed(ctx context.Context, targetUin string, items []
 	if err := writeMoodViewer(root, file); err != nil {
 		return &b.results, err
 	}
+	b.ledger.commit(ctx.Err() == nil, b.logger)
 	return &b.results, nil
 }
 
@@ -730,8 +774,11 @@ func (b *MoodBackup) downloadOneMedia(ctx context.Context, root, targetUin strin
 
 	if util.Exists(dest) {
 		if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
-			b.noteMediaSuccess(m.Type == "video")
-			return
+			// 账本一致才离线跳过；条目不一致（缺失/被改）落下去重新下载；无条目沿用旧行为。
+			if b.ledger.decision(ownerTID, m) != LedgerSkipMismatch {
+				b.noteMediaSuccess(m.Type == "video")
+				return
+			}
 		}
 	}
 
@@ -764,6 +811,8 @@ func (b *MoodBackup) downloadOneMedia(ctx context.Context, root, targetUin strin
 		t := time.Unix(created, 0)
 		_ = os.Chtimes(filepath.Join(root, filepath.FromSlash(m.Path)), t, t)
 	}
+	// 下载成功（失败已在上面 return）才登记进完整性账本。
+	b.ledger.stage(ownerTID, m)
 	b.noteMediaSuccess(m.Type == "video")
 }
 

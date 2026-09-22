@@ -26,6 +26,9 @@ type hlsVariant struct {
 	bandwidth int    // EXT-X-STREAM-INF 中的 BANDWIDTH，越大通常越清晰
 }
 
+// hlsPartExt 是 HLS 分片拼接期间的临时文件后缀；成功后才改名去掉它。
+const hlsPartExt = ".part"
+
 // IsHLSURL 判断 URL 是否为 HLS 播放列表（路径含 .m3u8，或查询串含 m3u8?）。
 func IsHLSURL(raw string) bool {
 	u := strings.ToLower(raw)
@@ -96,11 +99,14 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
 		}
 	}
 
-	out, err := os.Create(target)
+	// 分片先写入 <target>.part：只有全部分片写完并关闭后才改名成最终文件。
+	// 中途失败或断电时留下的是 .part 半成品（完整性核验据此识别未完成项），
+	// 绝不会出现一个「最终文件名但内容只有一半」的 HLS 视频。
+	partPath := target + hlsPartExt
+	out, err := os.Create(partPath)
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
 
 	// fMP4 的初始化段必须写在媒体分片前面，否则本地文件无法播放。
 	parts := make([]string, 0, len(segments)+1)
@@ -147,6 +153,7 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
 			if bar != nil {
 				bar.Abort(true)
 			}
+			_ = out.Close()
 			return nil, ctx.Err()
 		default:
 		}
@@ -156,12 +163,14 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
 			if bar != nil {
 				bar.Abort(true)
 			}
+			_ = out.Close()
 			return nil, fmt.Errorf("hls segment download failed: %w", segErr)
 		}
 		if segStatus != http.StatusOK && segStatus != http.StatusPartialContent {
 			if bar != nil {
 				bar.Abort(true)
 			}
+			_ = out.Close()
 			return nil, &StatusError{Code: segStatus, Status: http.StatusText(segStatus)}
 		}
 		n, writeErr := out.Write(segBody)
@@ -169,6 +178,7 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
 			if bar != nil {
 				bar.Abort(true)
 			}
+			_ = out.Close()
 			return nil, writeErr
 		}
 		copied += int64(n)
@@ -182,6 +192,18 @@ func (c *Client) downloadHLS(ctx context.Context, playlistURL, target string, he
 
 	if bar != nil {
 		bar.SetTotal(-1, true)
+	}
+
+	// 全部段落盘：先 Sync 再关闭，最后原子改名，最终文件只在这一刻第一次出现。
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return nil, err
+	}
+	if err := out.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(partPath, target); err != nil {
+		return nil, fmt.Errorf("finalize hls file failed: %w", err)
 	}
 
 	return map[string]interface{}{

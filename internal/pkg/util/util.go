@@ -4,6 +4,8 @@ package util
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math/rand"
@@ -32,6 +34,33 @@ func FileMD5(path string) (string, error) {
 	}
 
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// digestBufSize 是流式摘要时的固定读缓冲大小（256 KiB），不随文件体积增长。
+const digestBufSize = 256 * 1024
+
+// FileSHA256 以流式读取的方式计算本地文件的 SHA-256 摘要（十六进制字符串）。
+// 适用于视频等大文件完整性核验，常驻内存只有固定大小缓冲。
+func FileSHA256(path string) (string, error) {
+	_, sum, err := FileDigest(path)
+	return sum, err
+}
+
+// FileDigest 一次顺序扫描同时得到字节数与 SHA-256，避免大文件读两遍。
+func FileDigest(path string) (int64, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	buf := make([]byte, digestBufSize)
+	n, err := io.CopyBuffer(h, f, buf)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // RandInt 返回一个位于 [min, max) 区间的伪随机整数
